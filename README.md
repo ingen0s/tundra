@@ -20,9 +20,34 @@ Early but tested. The server is single-threaded and event-driven (epoll on Linux
 - **Health:** ping/pong latency and per-session counters via `HEALTH_CHECK`.
 - **Backpressure:** each client's outgoing queue is capped at 1 MiB; clients that can't keep up are disconnected instead of stalling the server.
 
+## Install
+
+Prebuilt binaries for every release are on the [releases page](https://github.com/ingen0s/tundra/releases). They need nothing else installed, and TLS is built in:
+
+| Platform | Download |
+|----------|----------|
+| Linux x64 / arm64 | `tundra-<version>-linux-x64.tar.gz` / `-linux-arm64.tar.gz` (fully static, any distro) |
+| macOS (Apple silicon and Intel) | `tundra-<version>-macos-universal.tar.gz` (macOS 11 or later) |
+| Windows x64 | `tundra-<version>-windows-x64.zip` (Windows 10 or later) |
+
+On Linux and macOS, one line installs the latest release to `~/.local/bin` after checking it against the release's `SHA256SUMS`:
+
+```bash
+curl -fsSL https://github.com/ingen0s/tundra/releases/latest/download/install.sh | sh
+```
+
+For a specific release or another location, set the variables on `sh`, not on `curl`:
+
+```bash
+curl -fsSL https://github.com/ingen0s/tundra/releases/latest/download/install.sh | TUNDRA_VERSION=0.2.0 sh
+curl -fsSL https://github.com/ingen0s/tundra/releases/latest/download/install.sh | sudo PREFIX=/usr/local sh
+```
+
+On Windows, unzip and run `tundra_chat_server.exe -w 8080`, then open http://localhost:8080/. The executables are not code-signed, so SmartScreen may warn the first time (choose "More info", then "Run anyway"). On macOS, a tarball downloaded with a browser is quarantined; clear that with `xattr -dr com.apple.quarantine tundra-*` (the install script is not affected). `tundra_chat_server -V` prints the version. The test client verifies TLS certificates against the system store; set `SSL_CERT_FILE` to use a different CA bundle.
+
 ## Quick start
 
-Build (SQLite is required; OpenSSL is optional and turns on TLS):
+To build from source instead (SQLite is required; OpenSSL is optional and turns on TLS):
 
 | Platform | Steps |
 |----------|-------|
@@ -30,7 +55,7 @@ Build (SQLite is required; OpenSSL is optional and turns on TLS):
 | macOS | `xcode-select --install` (SQLite ships with macOS); for TLS `brew install openssl@3 pkg-config` and build with `PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig" make`, otherwise just `make` |
 | Windows | Install [MSYS2](https://www.msys2.org/), open the **MINGW64** shell, `pacman -S make mingw-w64-x86_64-gcc mingw-w64-x86_64-sqlite3 mingw-w64-x86_64-openssl mingw-w64-x86_64-pkgconf`, then `make` (binaries end in `.exe`) |
 
-The build finds OpenSSL through `pkg-config`; `make TLS=0` leaves TLS out.
+The build finds OpenSSL through `pkg-config`; `make TLS=0` leaves TLS out. `make STATIC=1` links SQLite and OpenSSL statically, as the release bundles do.
 
 Run:
 
@@ -164,9 +189,12 @@ Layout:
 | `sdk/python/` | Python SDK and examples |
 | `sdk/typescript/` | TypeScript SDK (Node and browsers) |
 | `test_client.c` | scriptable CLI client |
-| `tests/` | codec unit tests and `integration.sh` |
+| `tests/` | codec unit tests, `integration.sh` and `smoke.py` |
+| `tools/` | build helpers and the release `install.sh` |
 | `fuzz/` | libFuzzer target and seed corpus |
 | `docs/PROTOCOL.md` | protocol specification |
+
+Releasing: push a tag such as `v0.2.0`. The release workflow builds the Linux (static musl), macOS (universal) and Windows bundles, runs the tests against each, and publishes them with `SHA256SUMS` and `install.sh`.
 
 Adding a message type: define it in `tundra_protocol.h`, add decode/encode and a struct in `tundra_codec.{h,c}` (the fuzzer checks they round-trip), add a seed to `fuzz/corpus`, handle it in `server/handlers.c`, and cover it in `tests/integration.sh`.
 

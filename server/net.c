@@ -34,7 +34,7 @@ static void set_want_write(Client *c, int on) {
  * moved, -1 for "try again when the socket is ready", -2 for an error;
  * client_recv also returns 0 when the peer closed. */
 static long client_send(Client *c, const void *buf, size_t len) {
-    if (c->ssl) return tls_send(c, buf, len);
+    if (c->ssl) return srv_tls_send(c, buf, len);
     for (;;) {
         long n = plat_send(c->sock, buf, len);
         if (n >= 0) return n;
@@ -46,7 +46,7 @@ static long client_send(Client *c, const void *buf, size_t len) {
 }
 
 static long client_recv(Client *c, void *buf, size_t len) {
-    if (c->ssl) return tls_recv(c, buf, len);
+    if (c->ssl) return srv_tls_recv(c, buf, len);
     for (;;) {
         long n = plat_recv(c->sock, buf, len);
         if (n >= 0) return n;
@@ -220,7 +220,7 @@ void mark_dead(Client *c) {
 static void reap_client(Client *c) {
     if (c->fd >= 0) {
         poller_remove(poller, c->sock);
-        tls_detach(c);
+        srv_tls_detach(c);
         plat_close(c->sock);
         log_info("client %d closed", c->fd);
     }
@@ -312,14 +312,14 @@ static void accept_clients(tsock_t listener, int proto) {
         Client *c = alloc_client(s);
         if (!c) {
             log_info("no free client slots, rejecting a connection");
-            if (proto == PROTO_TCP && !tls_enabled()) reject_full(s); /* a plaintext error means nothing to a TLS client */
+            if (proto == PROTO_TCP && !srv_tls_enabled()) reject_full(s); /* a plaintext error means nothing to a TLS client */
             else plat_close(s);
             continue;
         }
         c->proto = proto;
-        if (tls_attach(c) < 0 || poller_add(poller, s, c) < 0) {
+        if (srv_tls_attach(c) < 0 || poller_add(poller, s, c) < 0) {
             log_info("cannot set up client %d", c->fd);
-            tls_detach(c);
+            srv_tls_detach(c);
             plat_close(s);
             c->fd = -1;
             c->sock = TSOCK_INVALID;
@@ -379,12 +379,12 @@ static int drain_tls_pending(void) {
     int more = 0;
     for (int i = 0; i < MAX_CLIENTS; i++) {
         Client *c = &clients[i];
-        if (c->fd < 0 || c->dead || c->close_after_flush || !tls_pending(c)) continue;
+        if (c->fd < 0 || c->dead || c->close_after_flush || !srv_tls_pending(c)) continue;
         read_client(c);
         if (!c->dead && c->out_len > 0) flush_client(c);
         /* a client closing after its flush reads no more, so its leftover
          * input must not keep the loop spinning */
-        if (!c->dead && !c->close_after_flush && tls_pending(c)) more = 1;
+        if (!c->dead && !c->close_after_flush && srv_tls_pending(c)) more = 1;
     }
     return more;
 }

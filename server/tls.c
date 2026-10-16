@@ -6,7 +6,7 @@
  * Connections stay non-blocking: OpenSSL's "want read" and "want write"
  * results map onto the poller, and bytes OpenSSL has already decrypted
  * but not yet handed over are drained without waiting for new socket
- * readiness (see tls_pending).
+ * readiness (see srv_tls_pending).
  */
 #include <stdio.h>
 #include <string.h>
@@ -29,15 +29,15 @@ static void log_ssl_errors(const char *what) {
     }
 }
 
-int tls_available(void) {
+int srv_tls_available(void) {
     return 1;
 }
 
-int tls_enabled(void) {
+int srv_tls_enabled(void) {
     return ctx != NULL;
 }
 
-int tls_init(const char *cert, const char *key) {
+int srv_tls_init(const char *cert, const char *key) {
     ctx = SSL_CTX_new(TLS_server_method());
     if (!ctx) {
         log_ssl_errors("context");
@@ -52,25 +52,25 @@ int tls_init(const char *cert, const char *key) {
     if (SSL_CTX_use_certificate_chain_file(ctx, cert) != 1) {
         log_ssl_errors("certificate");
         log_info("tls: cannot load certificate chain from %s", cert);
-        tls_free();
+        srv_tls_free();
         return -1;
     }
     if (SSL_CTX_use_PrivateKey_file(ctx, key, SSL_FILETYPE_PEM) != 1 || SSL_CTX_check_private_key(ctx) != 1) {
         log_ssl_errors("key");
         log_info("tls: cannot load a private key matching the certificate from %s", key);
-        tls_free();
+        srv_tls_free();
         return -1;
     }
     log_info("tls: enabled with %s", cert);
     return 0;
 }
 
-void tls_free(void) {
+void srv_tls_free(void) {
     if (ctx) SSL_CTX_free(ctx);
     ctx = NULL;
 }
 
-int tls_attach(Client *c) {
+int srv_tls_attach(Client *c) {
     if (!ctx) return 0;
     SSL *ssl = SSL_new(ctx);
     if (!ssl) {
@@ -87,7 +87,7 @@ int tls_attach(Client *c) {
     return 0;
 }
 
-void tls_detach(Client *c) {
+void srv_tls_detach(Client *c) {
     if (!c->ssl) return;
     SSL *ssl = c->ssl;
     if (!c->tls_failed) SSL_shutdown(ssl); /* best effort close_notify */
@@ -120,7 +120,7 @@ static long map_result(Client *c, int r, const char *what) {
     }
 }
 
-long tls_recv(Client *c, void *buf, size_t len) {
+long srv_tls_recv(Client *c, void *buf, size_t len) {
     if (len > 0x7fffffff) len = 0x7fffffff;
     ERR_clear_error();
     int r = SSL_read(c->ssl, buf, (int)len);
@@ -131,7 +131,7 @@ long tls_recv(Client *c, void *buf, size_t len) {
     return map_result(c, r, "read");
 }
 
-long tls_send(Client *c, const void *buf, size_t len) {
+long srv_tls_send(Client *c, const void *buf, size_t len) {
     if (len > 0x7fffffff) len = 0x7fffffff;
     ERR_clear_error();
     int r = SSL_write(c->ssl, buf, (int)len);
@@ -143,25 +143,25 @@ long tls_send(Client *c, const void *buf, size_t len) {
     return m == 0 ? -2 : m; /* a close while writing is an error for the writer */
 }
 
-int tls_pending(const Client *c) {
+int srv_tls_pending(const Client *c) {
     return c->ssl && SSL_pending(c->ssl) > 0;
 }
 
 #else /* built without OpenSSL */
 
-int tls_available(void) { return 0; }
-int tls_enabled(void) { return 0; }
-int tls_init(const char *cert, const char *key) {
+int srv_tls_available(void) { return 0; }
+int srv_tls_enabled(void) { return 0; }
+int srv_tls_init(const char *cert, const char *key) {
     (void)cert;
     (void)key;
     log_info("tls: this build has no TLS support (rebuild with OpenSSL installed)");
     return -1;
 }
-void tls_free(void) {}
-int tls_attach(Client *c) { (void)c; return 0; }
-void tls_detach(Client *c) { (void)c; }
-long tls_recv(Client *c, void *buf, size_t len) { (void)c; (void)buf; (void)len; return -2; }
-long tls_send(Client *c, const void *buf, size_t len) { (void)c; (void)buf; (void)len; return -2; }
-int tls_pending(const Client *c) { (void)c; return 0; }
+void srv_tls_free(void) {}
+int srv_tls_attach(Client *c) { (void)c; return 0; }
+void srv_tls_detach(Client *c) { (void)c; }
+long srv_tls_recv(Client *c, void *buf, size_t len) { (void)c; (void)buf; (void)len; return -2; }
+long srv_tls_send(Client *c, const void *buf, size_t len) { (void)c; (void)buf; (void)len; return -2; }
+int srv_tls_pending(const Client *c) { (void)c; return 0; }
 
 #endif

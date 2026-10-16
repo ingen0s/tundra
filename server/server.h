@@ -256,15 +256,15 @@ void agents_session_released(Session *s);
 void agents_request_dropped(const uint8_t *payload, size_t len);
 
 /* ---- tls.c ---- */
-int tls_available(void);                  /* built with OpenSSL */
-int tls_enabled(void);                    /* certificate loaded */
-int tls_init(const char *cert, const char *key);
-void tls_free(void);
-int tls_attach(Client *c);                /* on accept, when enabled */
-void tls_detach(Client *c);
-long tls_recv(Client *c, void *buf, size_t len); /* >0, 0 closed, -1 retry, -2 error */
-long tls_send(Client *c, const void *buf, size_t len); /* >0, -1 retry, -2 error */
-int tls_pending(const Client *c);         /* decrypted bytes waiting inside OpenSSL */
+int srv_tls_available(void);                  /* built with OpenSSL */
+int srv_tls_enabled(void);                    /* certificate loaded */
+int srv_tls_init(const char *cert, const char *key);
+void srv_tls_free(void);
+int srv_tls_attach(Client *c);                /* on accept, when enabled */
+void srv_tls_detach(Client *c);
+long srv_tls_recv(Client *c, void *buf, size_t len); /* >0, 0 closed, -1 retry, -2 error */
+long srv_tls_send(Client *c, const void *buf, size_t len); /* >0, -1 retry, -2 error */
+int srv_tls_pending(const Client *c);         /* decrypted bytes waiting inside OpenSSL */
 
 /* ---- ws.c ---- */
 void ws_process_input(Client *c);          /* HTTP request or WebSocket frames */

@@ -3,14 +3,34 @@ CFLAGS  ?= -O2 -g
 # Required flags are appended with `override` so `make CFLAGS=...` cannot drop them.
 override CFLAGS += -std=c11 -Wall -Wextra -Wshadow -Wformat=2 -Werror $(SANFLAGS)
 SANITIZE := -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all
+# Version reported by -V and in the startup log.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+VERSION_FLAG := -DTUNDRA_RELEASE='"$(VERSION)"'
+
+# STATIC=1 links SQLite and OpenSSL statically (release bundles). On macOS
+# that needs static-only OpenSSL on PKG_CONFIG_PATH; elsewhere the whole
+# binary is linked with -static.
+PKG_CONFIG ?= pkg-config
+ifeq ($(STATIC),1)
+  PKG_STATIC := --static
+  ifneq ($(shell uname -s),Darwin)
+    override LDFLAGS += -static
+  endif
+endif
+
 # TLS: on when OpenSSL is found (pkg-config), off with TLS=0.
 TLS ?= auto
 ifeq ($(TLS),auto)
-  override TLS := $(shell pkg-config --exists openssl 2>/dev/null && echo 1 || echo 0)
+  override TLS := $(shell $(PKG_CONFIG) --exists openssl 2>/dev/null && echo 1 || echo 0)
 endif
 ifeq ($(TLS),1)
-  TLS_CFLAGS := -DTUNDRA_TLS $(shell pkg-config --cflags openssl 2>/dev/null)
-  TLS_LIBS   := $(or $(shell pkg-config --libs openssl 2>/dev/null),-lssl -lcrypto)
+  TLS_CFLAGS := -DTUNDRA_TLS $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
+  TLS_LIBS   := $(or $(shell $(PKG_CONFIG) $(PKG_STATIC) --libs openssl 2>/dev/null),-lssl -lcrypto)
+endif
+ifeq ($(STATIC),1)
+  SQLITE_LIBS := $(or $(shell $(PKG_CONFIG) --static --libs sqlite3 2>/dev/null),-lsqlite3)
+else
+  SQLITE_LIBS := -lsqlite3
 endif
 
 # Per-platform settings. Windows builds use MinGW-w64 (MSYS2).
@@ -23,7 +43,7 @@ else
   NET_LIBS :=
 endif
 
-BUILD   := build
+BUILD   ?= build
 SERVER  := $(BUILD)/tundra_chat_server$(EXE)
 CLIENT  := $(BUILD)/tundra_client$(EXE)
 CODEC_T := $(BUILD)/codec_test$(EXE)
@@ -47,13 +67,13 @@ $(BUILD)/web_index.h: web/index.html tools/embed.py | $(BUILD)
 	python3 tools/embed.py web/index.html $@ web_index_html
 
 $(SERVER): $(SERVER_SRC) server/server.h $(CODEC) $(PLATFORM) $(HEADERS) $(BUILD)/web_index.h | $(BUILD)
-	$(CC) $(CFLAGS) $(TLS_CFLAGS) -I$(BUILD) -o $@ $(SERVER_SRC) $(CODEC) tundra_platform.c $(LDFLAGS) -lsqlite3 $(TLS_LIBS) $(LDLIBS) $(NET_LIBS)
+	$(CC) $(CFLAGS) $(TLS_CFLAGS) $(VERSION_FLAG) -I$(BUILD) -o $@ $(SERVER_SRC) $(CODEC) tundra_platform.c $(LDFLAGS) $(SQLITE_LIBS) $(TLS_LIBS) $(LDLIBS) $(NET_LIBS)
 
 $(CLIENT): test_client.c $(CODEC) $(PLATFORM) $(HEADERS) | $(BUILD)
-	$(CC) $(CFLAGS) $(TLS_CFLAGS) -o $@ test_client.c $(CODEC) tundra_platform.c $(LDFLAGS) $(TLS_LIBS) $(LDLIBS) $(NET_LIBS)
+	$(CC) $(CFLAGS) $(TLS_CFLAGS) $(VERSION_FLAG) -o $@ test_client.c $(CODEC) tundra_platform.c $(LDFLAGS) $(TLS_LIBS) $(LDLIBS) $(NET_LIBS)
 
 $(CODEC_T): tests/codec_test.c $(CODEC) $(HEADERS) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/codec_test.c $(CODEC)
+	$(CC) $(CFLAGS) -o $@ tests/codec_test.c $(CODEC) $(LDFLAGS)
 
 # Build with AddressSanitizer and UndefinedBehaviorSanitizer.
 asan:
