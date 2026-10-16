@@ -1,0 +1,206 @@
+name: Release
+
+# Prebuilt bundles for Linux (x64, arm64), macOS (universal) and Windows
+# (x64). A version tag (v*) builds, tests and publishes a GitHub release;
+# pull requests that touch the release build only build and test.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "Makefile"
+      - "tools/install.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  OPENSSL_VERSION: "3.5.9"
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: v
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then v="${GITHUB_REF_NAME#v}"; else v="$(git describe --tags --always)"; fi
+          echo "version=$v" >>"$GITHUB_OUTPUT"
+
+  linux:
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      NAME: tundra-${{ needs.version.outputs.version }}-linux-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build fully static binaries (musl, SQLite and OpenSSL linked in)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e VERSION alpine:3.20 sh -euc '
+            apk add --no-cache build-base pkgconf python3 sqlite-dev sqlite-static openssl-dev openssl-libs-static linux-headers >/dev/null
+            make STATIC=1 CFLAGS=-O2 VERSION="$VERSION"
+            strip build/tundra_chat_server build/tundra_client
+            chown -R '"$(id -u):$(id -g)"' build'
+      - name: Check the binaries are static
+        run: |
+          file build/tundra_chat_server build/tundra_client
+          file build/tundra_chat_server | grep -q "statically linked"
+          ./build/tundra_chat_server -V | grep -q "$VERSION (tls)"
+      - name: Test on the runner (a different libc from the build)
+        run: |
+          ./build/codec_test
+          ./tests/integration.sh
+          python3 tests/smoke.py build/tundra_chat_server
+      - name: Package
+        run: |
+          mkdir -p "dist/$NAME"
+          cp build/tundra_chat_server build/tundra_client README.md LICENSE "dist/$NAME/"
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: dist/${{ env.NAME }}.tar.gz
+
+  macos:
+    needs: version
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      NAME: tundra-${{ needs.version.outputs.version }}-macos-universal
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: brew install pkg-config
+      - name: Cache static OpenSSL
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ~/openssl
+          key: openssl-${{ env.OPENSSL_VERSION }}-macos-universal-11.0
+      - name: Build static OpenSSL for arm64 and x86_64
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSLO "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz"
+          curl -fsSLO "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz.sha256"
+          echo "$(awk '{print $1}' openssl-$OPENSSL_VERSION.tar.gz.sha256)  openssl-$OPENSSL_VERSION.tar.gz" | shasum -a 256 -c
+          for arch in arm64 x86_64; do
+            rm -rf src && mkdir src && tar -xzf "openssl-$OPENSSL_VERSION.tar.gz" -C src --strip-components 1
+            (cd src && ./Configure "darwin64-$arch-cc" no-shared no-tests no-docs no-apps \
+                --prefix="$HOME/openssl/$arch" --libdir=lib -mmacosx-version-min=11.0 &&
+             make -j"$(sysctl -n hw.ncpu)" build_libs >/dev/null && make install_dev >/dev/null)
+          done
+      - name: Build both architectures and merge them
+        run: |
+          for arch in arm64 x86_64; do
+            PKG_CONFIG_PATH="$HOME/openssl/$arch/lib/pkgconfig" \
+              make BUILD="build-$arch" STATIC=1 CFLAGS=-O2 VERSION="$VERSION" CC="cc -arch $arch -mmacosx-version-min=11.0"
+          done
+          mkdir -p build
+          for bin in tundra_chat_server tundra_client codec_test; do
+            lipo -create -output "build/$bin" "build-arm64/$bin" "build-x86_64/$bin"
+          done
+          strip -x build/tundra_chat_server build/tundra_client
+          codesign --force -s - build/tundra_chat_server build/tundra_client
+      - name: Check the binaries
+        run: |
+          lipo -archs build/tundra_chat_server | grep -q "x86_64 arm64"
+          if otool -L build/tundra_chat_server | grep -qiE "ssl|crypto|homebrew"; then otool -L build/tundra_chat_server; exit 1; fi
+          ./build/tundra_chat_server -V | grep -q "$VERSION (tls)"
+      - name: Test
+        run: |
+          ./build/codec_test
+          ./tests/integration.sh
+          python3 tests/smoke.py build/tundra_chat_server
+      - name: Package
+        run: |
+          mkdir -p "dist/$NAME"
+          cp build/tundra_chat_server build/tundra_client README.md LICENSE "dist/$NAME/"
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: dist/${{ env.NAME }}.tar.gz
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      NAME: tundra-${{ needs.version.outputs.version }}-windows-x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-sqlite3
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-python
+      - name: Build static executables
+        run: |
+          make STATIC=1 CFLAGS=-O2 VERSION="$VERSION"
+          strip build/tundra_chat_server.exe build/tundra_client.exe
+      - name: Check the executables need only Windows DLLs
+        run: |
+          for exe in build/tundra_chat_server.exe build/tundra_client.exe; do
+            dlls=$(objdump -p "$exe" | awk '/DLL Name/ {print $3}')
+            echo "$exe: $dlls"
+            if echo "$dlls" | grep -qiE "^lib|sqlite|ssl|crypto-|winpthread|gcc"; then exit 1; fi
+          done
+          ./build/tundra_chat_server.exe -V | grep -q "$VERSION (tls)"
+      - name: Test
+        run: |
+          ./build/codec_test.exe
+          python tests/smoke.py build/tundra_chat_server.exe
+      - name: Package
+        run: |
+          mkdir -p "dist/$NAME"
+          cp build/tundra_chat_server.exe build/tundra_client.exe README.md LICENSE "dist/$NAME/"
+          cd dist && python -m zipfile -c "$NAME.zip" "$NAME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: dist/${{ env.NAME }}.zip
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: [version, linux, macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum tundra-* | tee SHA256SUMS
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp tools/install.sh dist/install.sh
+          gh release create "$GITHUB_REF_NAME" dist/* --title "Tundra ${{ needs.version.outputs.version }}" --generate-notes

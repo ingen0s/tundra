@@ -365,6 +365,10 @@ static int run_action(const Action *a) {
     return send_msg(&m);
 }
 
+#ifndef TUNDRA_RELEASE
+#define TUNDRA_RELEASE "dev"
+#endif
+
 static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s -u username [-H host] [-p port]"
@@ -374,7 +378,7 @@ static void usage(const char *prog) {
             " [-k token] [-r session-id [-f last-id]] [-a]\n"
             "          [-j #room] [-L #room] [-t target] [-m text] [-R] [-W #room] [-y #room] [-c]\n"
             "          [-G capabilities] [-q agent:body] [-Q] [-E [-S]]\n"
-            "          [-w seconds]\n",
+            "          [-w seconds] [-V]\n",
             prog);
 }
 
@@ -391,7 +395,7 @@ int main(int argc, char **argv) {
     double wait_s = 1.0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "H:p:u:r:f:ak:ESsxj:L:t:m:RW:y:cG:q:Qw:h")) != -1) {
+    while ((opt = getopt(argc, argv, "H:p:u:r:f:ak:ESsxj:L:t:m:RW:y:cG:q:Qw:Vh")) != -1) {
         switch (opt) {
             case 'H': host = optarg; break;
             case 'p': port = optarg; break;
@@ -406,6 +410,7 @@ int main(int argc, char **argv) {
             case 'S': stream_agent = 1; break;
             case 't': target = optarg; break;
             case 'w': wait_s = atof(optarg); break;
+            case 'V': printf("tundra_client %s\n", TUNDRA_RELEASE); return 0;
             case 'j': case 'L': case 'm': case 'R': case 'W': case 'y': case 'c': case 'G': case 'q': case 'Q':
                 if (nactions < MAX_ACTIONS) {
                     actions[nactions].op = (char)opt;

@@ -26,10 +26,14 @@ static void tick(void) {
     }
 }
 
+#ifndef TUNDRA_RELEASE
+#define TUNDRA_RELEASE "dev"
+#endif
+
 static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s [-p port] [-w http-port] [-C cert.pem -K key.pem] [-d database] [-t tokens-file [-A]] [-i idle-timeout-s] [-g resume-grace-s]\n"
-            "          [-T agent-timeout-s] [-v]\n"
+            "          [-T agent-timeout-s] [-v] [-V]\n"
             "  -w  also serve the web client and WebSockets (GET /ws) on this port\n"
             "%s"
             "  -d  keep messages in this SQLite database (history survives restarts)\n"
@@ -49,7 +53,7 @@ int main(int argc, char **argv) {
     const char *tls_cert = NULL;
     const char *tls_key = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "p:w:d:t:AC:K:i:g:T:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "p:w:d:t:AC:K:i:g:T:vVh")) != -1) {
         switch (opt) {
             case 'd': db_path = optarg; break;
             case 'w': ws_port = atoi(optarg); break;
@@ -62,6 +66,7 @@ int main(int argc, char **argv) {
             case 'g': resume_grace = atoi(optarg); break;
             case 'T': agent_timeout = atoi(optarg); break;
             case 'v': verbose = 1; break;
+            case 'V': printf("tundra %s%s\n", TUNDRA_RELEASE, tls_available() ? " (tls)" : ""); return 0;
             default: usage(argv[0]); return opt == 'h' ? 0 : 1;
         }
     }
@@ -87,7 +92,7 @@ int main(int argc, char **argv) {
     if (net_listen(port) < 0) return 1;
     if (ws_port && net_listen_ws(ws_port) < 0) return 1;
     if (ws_port) log_info("web client and WebSockets on %s://localhost:%d/", tls_enabled() ? "https" : "http", ws_port);
-    log_info("Tundra server listening on port %d", port);
+    log_info("Tundra %s server listening on port %d", TUNDRA_RELEASE, port);
 
     last_ping = mono_s();
     net_run(tick);
