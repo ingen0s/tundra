@@ -32,22 +32,26 @@ static void copy_name(char *dst, size_t cap, TundraBytes src) {
     dst[n] = '\0';
 }
 
-const LoggedMessage *msglog_append(uint8_t kind, TundraBytes target, const char *sender, TundraBytes text) {
+static LoggedMessage *insert(uint64_t id, uint64_t ts_ms, uint8_t kind, TundraBytes target, const char *sender,
+                             TundraBytes text) {
     uint8_t *copy = malloc(text.len ? text.len : 1);
     if (!copy) return NULL;
     if (text.len) memcpy(copy, text.p, text.len);
 
-    /* make room: by count (the slot we are about to reuse) and by bytes */
+    /* Make room: the log covers at most MSGLOG_CAPACITY consecutive ids
+     * (restored ids may skip some, leaving empty slots) and MSGLOG_MAX_BYTES
+     * of text. Oldest first. */
     while (first_id < next_id &&
-           (next_id - first_id >= MSGLOG_CAPACITY || total_bytes + text.len > MSGLOG_MAX_BYTES)) {
+           (id - first_id >= MSGLOG_CAPACITY || total_bytes + text.len > MSGLOG_MAX_BYTES)) {
         evict_oldest();
     }
+    if (first_id == next_id) first_id = id; /* empty log */
 
-    uint64_t id = next_id++;
+    next_id = id + 1;
     LoggedMessage *m = slot(id);
     memset(m, 0, sizeof(*m));
     m->id = id;
-    m->ts_ms = wall_ms();
+    m->ts_ms = ts_ms;
     m->kind = kind;
     copy_name(m->target, sizeof(m->target), target);
     strncpy(m->sender, sender, sizeof(m->sender) - 1);
@@ -55,6 +59,21 @@ const LoggedMessage *msglog_append(uint8_t kind, TundraBytes target, const char 
     m->text_len = text.len;
     total_bytes += text.len;
     return m;
+}
+
+const LoggedMessage *msglog_append(uint8_t kind, TundraBytes target, const char *sender, TundraBytes text) {
+    /* the store may have reserved ids beyond what the log holds */
+    uint64_t floor = store_next_id();
+    if (floor > next_id) next_id = floor;
+    if (store_reserve(next_id) < 0) return NULL;
+    LoggedMessage *m = insert(next_id, wall_ms(), kind, target, sender, text);
+    if (m) store_append(m);
+    return m;
+}
+
+int msglog_restore(uint64_t id, uint64_t ts_ms, uint8_t kind, TundraBytes target, const char *sender, TundraBytes text) {
+    if (id < next_id || id == 0) return -1;
+    return insert(id, ts_ms, kind, target, sender, text) ? 0 : -1;
 }
 
 const LoggedMessage *msglog_get(uint64_t id) {

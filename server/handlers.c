@@ -76,6 +76,15 @@ static void handle_register(Client *c, uint16_t seq, const TundraMsg *m) {
         return;
     }
 
+    TundraBytes token;
+    int has_token = tundra_reg_find(m->u.reg.ext, REG_TOKEN, &token);
+    if (!auth_check(username, has_token ? &token : NULL)) {
+        log_info("rejected registration for %s: bad or missing token", username);
+        send_error(c, seq, ERR_UNAUTHORIZED, "Invalid or missing token");
+        close_after_flush(c);
+        return;
+    }
+
     if (find_session_by_name(username)) {
         send_error(c, seq, ERR_USERNAME_TAKEN, "Username already taken");
         close_after_flush(c);
@@ -90,6 +99,10 @@ static void handle_register(Client *c, uint16_t seq, const TundraMsg *m) {
     }
     uuid_generate(s->id);
     s->start_id = s->written_id = msglog_last_id();
+    if (has_token && token.len <= sizeof(s->auth_token)) {
+        memcpy(s->auth_token, token.p, token.len);
+        s->auth_token_len = token.len;
+    }
     memcpy(s->username, username, uname.len + 1);
     s->connected_at = mono_s();
     attach(s, c);
@@ -272,22 +285,36 @@ static void handle_history(Client *c, uint16_t seq, const TundraMsg *req) {
     size_t limit = req->u.history.limit;
     if (limit == 0 || limit > TUNDRA_MAX_HISTORY) limit = TUNDRA_MAX_HISTORY;
 
-    /* Walk backwards from before_id, newest first, until we have `limit`
+    /* Collect newest first, from the database when there is one (it goes
+     * back further), else from the in-memory log, until we have `limit`
      * messages for this room or the reply would not fit. */
     const LoggedMessage *picked[TUNDRA_MAX_HISTORY];
+    static LoggedMessage rows[TUNDRA_MAX_HISTORY];
+    size_t nrows = 0;
     size_t npicked = 0;
     size_t budget = TUNDRA_MAX_PAYLOAD - (1 + TUNDRA_MAX_ROOM + 2);
-    uint64_t id = req->u.history.before_id ? req->u.history.before_id - 1 : msglog_last_id();
-    if (id > msglog_last_id()) id = msglog_last_id();
-    for (; id > 0 && npicked < limit; id--) {
-        const LoggedMessage *lm = msglog_get(id);
-        if (!lm) break; /* evicted: nothing older is held either */
-        if (lm->id < r->first_msg_id) break; /* older messages belong to an earlier room of this name */
-        if (lm->kind != CHAT_ROOM || strcmp(lm->target, r->name) != 0) continue;
-        size_t sz = chat_entry_size(lm);
-        if (sz > budget) break;
-        budget -= sz;
-        picked[npicked++] = lm;
+    if (store_enabled()) {
+        nrows = store_history(r->name, req->u.history.before_id, limit, rows);
+        for (size_t i = 0; i < nrows; i++) {
+            if (rows[i].id < r->first_msg_id) break; /* from an earlier room of this name */
+            size_t sz = chat_entry_size(&rows[i]);
+            if (sz > budget) break;
+            budget -= sz;
+            picked[npicked++] = &rows[i];
+        }
+    } else {
+        uint64_t id = req->u.history.before_id ? req->u.history.before_id - 1 : msglog_last_id();
+        if (id > msglog_last_id()) id = msglog_last_id();
+        for (; id > 0 && npicked < limit; id--) {
+            const LoggedMessage *lm = msglog_get(id);
+            if (!lm) break; /* evicted: nothing older is held either */
+            if (lm->id < r->first_msg_id) break; /* older messages belong to an earlier room of this name */
+            if (lm->kind != CHAT_ROOM || strcmp(lm->target, r->name) != 0) continue;
+            size_t sz = chat_entry_size(lm);
+            if (sz > budget) break;
+            budget -= sz;
+            picked[npicked++] = lm;
+        }
     }
 
     static uint8_t entries[TUNDRA_MAX_PAYLOAD];
@@ -303,6 +330,7 @@ static void handle_history(Client *c, uint16_t seq, const TundraMsg *req) {
     m.u.list.entries.p = entries;
     m.u.list.entries.len = w.ok ? w.len : 0;
     send_msg(c, &m, seq, 0);
+    for (size_t i = 0; i < nrows; i++) free(rows[i].text);
 }
 
 /* ---- legacy agent command: broadcast to the lobby ---- */

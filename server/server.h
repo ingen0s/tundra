@@ -65,6 +65,8 @@ typedef struct Session {
     uint32_t latency_ms;
     uint32_t messages_sent;
     uint32_t messages_received;
+    uint8_t auth_token[256];    /* token presented at registration, for re-checks */
+    size_t auth_token_len;
 } Session;
 
 typedef struct Client {
@@ -149,6 +151,9 @@ int chat_replay_start(Session *s, uint64_t after_id);
 void backlog_clear(Session *s);
 void sessions_expire(void);
 void sessions_ping(void);
+/* After the tokens file changes: ends sessions whose name no longer
+ * accepts the token they registered with. */
+void sessions_recheck_auth(void);
 
 /* ---- rooms.c ---- */
 Room *room_find(TundraBytes name);
@@ -181,7 +186,34 @@ const LoggedMessage *msglog_get(uint64_t id);   /* NULL if never assigned or evi
 uint64_t msglog_last_id(void);
 uint64_t msglog_first_id(void);  /* oldest id still held (last_id + 1 when empty) */
 void msglog_to_chat(const LoggedMessage *m, TundraMsg *out);
+/* Re-inserts a stored message at startup; ids must be increasing. 0 on success. */
+int msglog_restore(uint64_t id, uint64_t ts_ms, uint8_t kind, TundraBytes target, const char *sender, TundraBytes text);
 void msglog_free(void);
+
+/* ---- auth.c ---- */
+extern int auth_require_all;
+int auth_init(const char *path);   /* 0 on success */
+void auth_reload(void);
+void auth_free(void);
+/* 1 if `username` may register with `token` (NULL when none was sent). */
+int auth_check(const char *username, const TundraBytes *token);
+
+/* ---- store.c ---- */
+int store_open(const char *path);  /* 0 on success; loads recent messages */
+void store_close(void);
+int store_enabled(void);
+void store_append(const LoggedMessage *m);
+/* Room deletions are remembered so a recreated room starts with an empty
+ * history, across restarts too. */
+void store_room_deleted(const char *room, uint64_t last_id);
+uint64_t store_room_floor(const char *room); /* first message id the room may show */
+/* Ids are reserved in the database in blocks before they are used, so a
+ * failed insert can never lead to an id being reused after a restart. */
+int store_reserve(uint64_t id);    /* 0 on success (always 0 without a store) */
+uint64_t store_next_id(void);      /* first id to use after loading, 0 without a store */
+/* Room history before `before_id` (0 = latest), newest first. Fills `out`
+ * with up to `limit` messages whose text the caller must free. */
+size_t store_history(const char *room, uint64_t before_id, size_t limit, LoggedMessage *out);
 
 /* ---- handlers.c ---- */
 void handle_frame(Client *c, const uint8_t *frame, size_t payload_len);

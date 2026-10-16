@@ -4,7 +4,7 @@ A small, fast chat server in C with a compact binary protocol. Rooms, direct mes
 
 ## Status
 
-Early but tested. The server is single-threaded on Linux epoll, handles up to 1,000 connections, and every change runs through unit tests, end-to-end tests, AddressSanitizer/UBSan and a fuzzer in CI. There is no TLS or authentication yet, so run it on a trusted network or behind a TLS-terminating proxy.
+Early but tested. The server is single-threaded on Linux epoll, handles up to 1,000 connections, and every change runs through unit tests, end-to-end tests, AddressSanitizer/UBSan and a fuzzer in CI. There is no built-in TLS yet, so on untrusted networks put it behind a TLS-terminating proxy.
 
 ## Features
 
@@ -13,15 +13,18 @@ Early but tested. The server is single-threaded on Linux epoll, handles up to 1,
 - **Direct messages** between users.
 - **Message ids and history:** every message gets a server-assigned id; the most recent 10,000 are kept in memory and can be paged with `HISTORY`.
 - **Session resume with exact catch-up:** a dropped connection keeps its name and rooms for 2 minutes. Reconnecting replays every message it missed from the server's log, starting after the client's last `ACK`, an explicit resume point, or what the server knows it wrote, paced so a long catch-up never overflows the connection.
+- **Optional token auth:** a `username token` file protects listed names (or, with `-A`, all of them); re-read on `SIGHUP`.
+- **Optional persistence:** with `-d chat.db`, messages go to SQLite; history pages back indefinitely and ids continue across restarts.
 - **Health:** ping/pong latency and per-session counters via `HEALTH_CHECK`.
 - **Backpressure:** each client's outgoing queue is capped at 1 MiB; clients that can't keep up are disconnected instead of stalling the server.
 
 ## Quick start
 
 ```bash
-sudo apt-get install uuid-dev
+sudo apt-get install uuid-dev libsqlite3-dev
 make
-./build/tundra_chat_server            # listens on 4242; -p PORT, -i idle s, -g resume grace s, -v frame log
+./build/tundra_chat_server            # listens on 4242
+./build/tundra_chat_server -d chat.db -t tokens.txt   # with persistence and token auth
 ```
 
 In two more terminals:
@@ -42,6 +45,7 @@ In two more terminals:
 | `-r id` | resume a session with the id from a previous `SESSION` line |
 | `-f id` | with `-r`: replay everything after this message id |
 | `-a` | acknowledge every chat message received |
+| `-k token` | authentication token for this username |
 | `-j #room` / `-L #room` | join / leave a room |
 | `-t target` | target for following `-m`: a `#room` or a username (default `#lobby`) |
 | `-m text` | send a message |
@@ -65,7 +69,7 @@ Layout:
 |------|------|
 | `tundra_protocol.h` | wire constants, big-endian helpers, bounds-checked reader/writer |
 | `tundra_codec.{h,c}` | decode/encode for every message type |
-| `server/` | server: `net.c` (epoll, I/O), `session.c`, `rooms.c`, `msglog.c`, `handlers.c`, `main.c` |
+| `server/` | server: `net.c` (epoll, I/O), `session.c`, `rooms.c`, `msglog.c`, `store.c` (SQLite), `auth.c`, `handlers.c`, `main.c` |
 | `test_client.c` | scriptable CLI client |
 | `tests/` | codec unit tests and `integration.sh` |
 | `fuzz/` | libFuzzer target and seed corpus |
@@ -74,6 +78,18 @@ Layout:
 Adding a message type: define it in `tundra_protocol.h`, add decode/encode and a struct in `tundra_codec.{h,c}` (the fuzzer checks they round-trip), add a seed to `fuzz/corpus`, handle it in `server/handlers.c`, and cover it in `tests/integration.sh`.
 
 ## Configuration
+
+Server options:
+
+| Option | Meaning |
+|--------|---------|
+| `-p port` | listen port (default 4242) |
+| `-d file` | store messages in this SQLite database |
+| `-t file` | tokens file, one `username token` per line; keep it private (`chmod 600`) |
+| `-A` | with `-t`: every username must be listed |
+| `-i seconds` | idle timeout (default 120) |
+| `-g seconds` | how long a disconnected session is held (default 120) |
+| `-v` | log every frame |
 
 Compile-time constants in `server/server.h` (two have command-line overrides):
 
@@ -92,7 +108,7 @@ Compile-time constants in `server/server.h` (two have command-line overrides):
 
 ## Roadmap
 
-- Token authentication and persistent history (SQLite)
+- Built-in TLS
 - Typed agent messaging: agents advertise capabilities, request/response with correlation ids
 - WebSocket gateway, browser client, Python SDK
 

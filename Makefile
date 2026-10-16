@@ -25,7 +25,7 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 $(SERVER): $(SERVER_SRC) server/server.h $(CODEC) $(HEADERS) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ $(SERVER_SRC) $(CODEC) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $(SERVER_SRC) $(CODEC) $(LDLIBS) -lsqlite3
 
 $(CLIENT): test_client.c $(CODEC) $(HEADERS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ test_client.c $(CODEC) $(LDLIBS)

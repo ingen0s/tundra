@@ -77,7 +77,7 @@ enum TundraMessageType {
  * each tag(1) len(2) value(len). Unknown tags are ignored. */
 enum TundraRegisterTag {
     REG_RESUME_FROM = 0x01, /* u64: last CHAT id the client has; replay everything after it */
-    REG_TOKEN       = 0x02  /* bytes: authentication token (reserved)                      */
+    REG_TOKEN       = 0x02  /* bytes: authentication token                                   */
 };
 
 enum TundraChatKind {
@@ -98,7 +98,8 @@ enum TundraErrorCode {
     ERR_NOT_REGISTERED  = 0x0005,
     ERR_NO_SUCH_TARGET  = 0x0006, /* unknown user or room */
     ERR_NOT_A_MEMBER    = 0x0007, /* room action that needs membership */
-    ERR_INVALID_NAME    = 0x0008  /* bad room or user name */
+    ERR_INVALID_NAME    = 0x0008, /* bad room or user name */
+    ERR_UNAUTHORIZED    = 0x0009  /* missing or wrong token for this username */
 };
 
 /* ---- big-endian helpers ---- */
