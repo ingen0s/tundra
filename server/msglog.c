@@ -38,16 +38,14 @@ static LoggedMessage *insert(uint64_t id, uint64_t ts_ms, uint8_t kind, TundraBy
     if (!copy) return NULL;
     if (text.len) memcpy(copy, text.p, text.len);
 
-    if (id > next_id) {
-        /* restored ids can skip (e.g. a failed insert); the log stays dense */
-        while (first_id < next_id) evict_oldest();
-        first_id = next_id = id;
-    }
-    /* make room: by count (the slot we are about to reuse) and by bytes */
+    /* Make room: the log covers at most MSGLOG_CAPACITY consecutive ids
+     * (restored ids may skip some, leaving empty slots) and MSGLOG_MAX_BYTES
+     * of text. Oldest first. */
     while (first_id < next_id &&
-           (next_id - first_id >= MSGLOG_CAPACITY || total_bytes + text.len > MSGLOG_MAX_BYTES)) {
+           (id - first_id >= MSGLOG_CAPACITY || total_bytes + text.len > MSGLOG_MAX_BYTES)) {
         evict_oldest();
     }
+    if (first_id == next_id) first_id = id; /* empty log */
 
     next_id = id + 1;
     LoggedMessage *m = slot(id);
@@ -64,6 +62,10 @@ static LoggedMessage *insert(uint64_t id, uint64_t ts_ms, uint8_t kind, TundraBy
 }
 
 const LoggedMessage *msglog_append(uint8_t kind, TundraBytes target, const char *sender, TundraBytes text) {
+    /* the store may have reserved ids beyond what the log holds */
+    uint64_t floor = store_next_id();
+    if (floor > next_id) next_id = floor;
+    if (store_reserve(next_id) < 0) return NULL;
     LoggedMessage *m = insert(next_id, wall_ms(), kind, target, sender, text);
     if (m) store_append(m);
     return m;

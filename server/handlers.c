@@ -99,6 +99,10 @@ static void handle_register(Client *c, uint16_t seq, const TundraMsg *m) {
     }
     uuid_generate(s->id);
     s->start_id = s->written_id = msglog_last_id();
+    if (has_token && token.len <= sizeof(s->auth_token)) {
+        memcpy(s->auth_token, token.p, token.len);
+        s->auth_token_len = token.len;
+    }
     memcpy(s->username, username, uname.len + 1);
     s->connected_at = mono_s();
     attach(s, c);

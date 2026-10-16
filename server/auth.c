@@ -28,10 +28,6 @@ static size_t entry_count = 0;
 static char *auth_path = NULL;
 int auth_require_all = 0;
 
-int auth_enabled(void) {
-    return auth_path != NULL;
-}
-
 /* Parses the file into a fresh table; the old table is kept on error. */
 static int load(const char *path) {
     FILE *f = fopen(path, "r");
@@ -52,10 +48,25 @@ static int load(const char *path) {
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '#' || *p == '\n' || *p == '\r' || *p == '\0') continue;
-        char user[64], token[MAX_TOKEN_LEN + 1];
-        if (sscanf(p, "%63s %256s", user, token) != 2 ||
-            !valid_username((const uint8_t *)user, strlen(user)) || strlen(token) > MAX_TOKEN_LEN) {
-            log_info("auth: %s:%d: expected \"username token\"", path, lineno);
+        if (!strchr(line, '\n') && !feof(f)) {
+            log_info("auth: %s:%d: line too long", path, lineno);
+            bad = 1;
+            break;
+        }
+        char user[64], token[MAX_TOKEN_LEN + 2], extra[2];
+        int fields = sscanf(p, "%63s %257s %1s", user, token, extra);
+        if (fields != 2 || !valid_username((const uint8_t *)user, strlen(user)) || strlen(token) > MAX_TOKEN_LEN) {
+            log_info("auth: %s:%d: expected \"username token\" (token up to %d characters)", path, lineno,
+                     MAX_TOKEN_LEN);
+            bad = 1;
+            continue;
+        }
+        int dup = 0;
+        for (size_t i = 0; i < count; i++) {
+            if (strcmp(table[i].username, user) == 0) dup = 1;
+        }
+        if (dup) {
+            log_info("auth: %s:%d: %s is listed twice", path, lineno, user);
             bad = 1;
             continue;
         }
@@ -69,7 +80,12 @@ static int load(const char *path) {
         memcpy(e->token, token, e->token_len);
     }
     fclose(f);
-    if (bad && count == 0) {
+    /* Fail closed: a file with any bad line, or no entries at all (for
+     * example one caught half-written), is rejected as a whole and the
+     * previous table stays in force. */
+    if (bad || count == 0) {
+        log_info("auth: %s rejected (%s); %s", path, bad ? "errors above" : "no entries",
+                 entries ? "keeping the previous tokens" : "not starting");
         free(table);
         return -1;
     }
@@ -87,7 +103,7 @@ int auth_init(const char *path) {
 }
 
 void auth_reload(void) {
-    if (auth_path) load(auth_path);
+    if (auth_path && load(auth_path) == 0) sessions_recheck_auth();
 }
 
 void auth_free(void) {

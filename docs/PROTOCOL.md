@@ -87,6 +87,8 @@ After the username, `REGISTER` may carry any number of extensions, each `u8 tag`
 
 Authentication is optional and configured on the server with a tokens file of `username token` lines (`-t`). A username listed there can only register with its token in the `TOKEN` extension; a missing or wrong token gets `UNAUTHORIZED` and the connection is closed. Names not in the file are open unless the server runs with `-A`, which requires every username to be listed. Resuming a session needs only its session id, which is itself a 122-bit secret. Tokens travel in clear text, so use TLS (for now, a TLS-terminating proxy) on untrusted networks.
 
+The file is re-read on `SIGHUP`. Loading fails closed: a file with any malformed line, a duplicate name, a token over 256 characters, or no entries at all is rejected as a whole; at startup the server refuses to start, and on reload the previous tokens stay in force. After a successful reload, sessions whose name no longer accepts the token they registered with are ended (`UNAUTHORIZED`, then disconnected).
+
 ## Sessions
 
 1. `REGISTER` with an all-zero id. The welcome `SYSTEM` frame carries your session id, and you are joined to `#lobby` (you get a `ROOM_EVENT` for it).
@@ -118,7 +120,7 @@ All catch-up is paced: it is sent only while the connection has less than 256 Ki
 - `HISTORY` and sending require membership. `WHO` and `LIST_ROOMS` do not.
 - A room that empties and is created again starts with an empty history.
 - `JOIN` for a room you are already in gets `INVALID_FORMAT` ("Already in that room").
-- The server keeps the most recent 10,000 messages (and at most 64 MiB of text) in memory. When it runs with a database (`-d`), every message is also stored there, `HISTORY` reads from the database (so it can page back indefinitely), and message ids and the recent log survive restarts.
+- The server keeps the most recent 10,000 messages (and at most 64 MiB of text) in memory. When it runs with a database (`-d`), room and direct messages are also written there, `HISTORY` reads from the database (so it can page back indefinitely), and the recent log survives restarts. Message ids are reserved in the database in blocks of 1,000 before use, so after a restart they keep increasing (possibly skipping some) and an id is never reused, even if an insert failed. A failed insert is logged; the message is still delivered.
 
 ## Direct messages
 

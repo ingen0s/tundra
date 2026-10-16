@@ -8,14 +8,21 @@
  * further than the in-memory log.
  */
 #include <sqlite3.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "server.h"
 
+#define ID_RESERVE_BLOCK 1000
+
 static sqlite3 *db = NULL;
 static sqlite3_stmt *insert_stmt = NULL;
 static sqlite3_stmt *history_stmt = NULL;
+/* Ids below `reserved` may have been handed out, so after a restart new
+ * ids start at or above it, even if some inserts failed. */
+static uint64_t reserved = 0;
+static uint64_t reserved_floor = 0; /* first id to use after a restart */
 
 int store_enabled(void) {
     return db != NULL;
@@ -47,6 +54,36 @@ static TundraBytes column_bytes(sqlite3_stmt *st, int col) {
     return b;
 }
 
+static int load_reserved(void) {
+    sqlite3_stmt *st;
+    if (prepare("SELECT MAX(COALESCE((SELECT value FROM meta WHERE key = 'next_id'), 1),"
+                "           COALESCE((SELECT MAX(id) + 1 FROM messages), 1))", &st) < 0) {
+        return -1;
+    }
+    if (sqlite3_step(st) == SQLITE_ROW) reserved = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    if (reserved == 0) reserved = 1;
+    return 0;
+}
+
+uint64_t store_next_id(void) {
+    return db ? reserved_floor : 0;
+}
+
+int store_reserve(uint64_t id) {
+    if (!db || id < reserved) return 0;
+    uint64_t upto = id + ID_RESERVE_BLOCK;
+    char sql[128];
+    snprintf(sql, sizeof(sql), "INSERT OR REPLACE INTO meta (key, value) VALUES ('next_id', %llu)",
+             (unsigned long long)upto);
+    if (exec(sql) < 0) {
+        log_info("store: cannot reserve message ids; refusing to send without them");
+        return -1;
+    }
+    reserved = upto;
+    return 0;
+}
+
 static int load_recent(void) {
     sqlite3_stmt *st;
     if (prepare("SELECT id, ts_ms, kind, target, sender, text FROM ("
@@ -65,8 +102,9 @@ static int load_recent(void) {
         }
     }
     sqlite3_finalize(st);
-    log_info("store: loaded %zu recent message(s), next id %llu", loaded,
-             (unsigned long long)(msglog_last_id() + 1));
+    /* never reuse an id that may have been handed out before a restart */
+    reserved_floor = reserved;
+    log_info("store: loaded %zu recent message(s), next id %llu", loaded, (unsigned long long)reserved_floor);
     return 0;
 }
 
@@ -77,6 +115,7 @@ int store_open(const char *path) {
         db = NULL;
         return -1;
     }
+    sqlite3_busy_timeout(db, 200);
     if (exec("PRAGMA journal_mode=WAL;"
              "PRAGMA synchronous=NORMAL;"
              "CREATE TABLE IF NOT EXISTS messages ("
@@ -88,6 +127,7 @@ int store_open(const char *path) {
              "  text BLOB NOT NULL);"
              "CREATE INDEX IF NOT EXISTS messages_by_target ON messages(kind, target, id);"
              "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);") < 0 ||
+        load_reserved() < 0 ||
         prepare("INSERT INTO messages (id, ts_ms, kind, target, sender, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 &insert_stmt) < 0 ||
         prepare("SELECT id, ts_ms, kind, target, sender, text FROM messages"
@@ -118,8 +158,10 @@ void store_append(const LoggedMessage *m) {
     sqlite3_bind_blob(st, 4, m->target, (int)strlen(m->target), SQLITE_STATIC);
     sqlite3_bind_text(st, 5, m->sender, -1, SQLITE_STATIC);
     sqlite3_bind_blob(st, 6, m->text_len ? (const void *)m->text : "", (int)m->text_len, SQLITE_STATIC);
-    if (sqlite3_step(st) != SQLITE_DONE) log_info("store: insert failed: %s", sqlite3_errmsg(db));
+    if (sqlite3_step(st) != SQLITE_DONE) log_info("store: insert of message %llu failed: %s",
+                                                   (unsigned long long)m->id, sqlite3_errmsg(db));
     sqlite3_reset(st);
+    sqlite3_clear_bindings(st);
 }
 
 void store_room_deleted(const char *room, uint64_t last_id) {
@@ -148,7 +190,8 @@ size_t store_history(const char *room, uint64_t before_id, size_t limit, LoggedM
     sqlite3_stmt *st = history_stmt;
     sqlite3_reset(st);
     sqlite3_bind_blob(st, 1, room, (int)strlen(room), SQLITE_STATIC);
-    sqlite3_bind_int64(st, 2, before_id ? (sqlite3_int64)before_id : INT64_MAX);
+    /* rows are written with the room as a BLOB, and BLOB never equals TEXT */
+    sqlite3_bind_int64(st, 2, before_id && before_id <= INT64_MAX ? (sqlite3_int64)before_id : INT64_MAX);
     sqlite3_bind_int(st, 3, (int)limit);
     size_t n = 0;
     while (n < limit && sqlite3_step(st) == SQLITE_ROW) {
@@ -169,5 +212,6 @@ size_t store_history(const char *room, uint64_t before_id, size_t limit, LoggedM
         n++;
     }
     sqlite3_reset(st);
+    sqlite3_clear_bindings(st);
     return n; /* newest first */
 }

@@ -606,10 +606,44 @@ kill -HUP "$auth_PID"
 wait_line "$TMP/auth.log" "3 user(s) loaded"
 client -u dora -w 0.2 >"$TMP/auth6.out"
 expect "tokens file is re-read on SIGHUP" "$TMP/auth6.out" "ERROR 9 "
+
+# a bad line rejects the whole reload and keeps the previous tokens
+cp "$TMP/tokens" "$TMP/tokens.good"
+printf 'alice\n' >"$TMP/tokens"
+kill -HUP "$auth_PID"
+wait_line "$TMP/auth.log" "keeping the previous tokens"
+client -u alice -w 0.2 >"$TMP/auth9.out"
+expect "a malformed tokens file fails closed" "$TMP/auth9.out" "ERROR 9 "
+: >"$TMP/tokens"
+kill -HUP "$auth_PID"
+sleep 0.3
+client -u alice -w 0.2 >"$TMP/auth10.out"
+expect "an empty tokens file fails closed" "$TMP/auth10.out" "ERROR 9 "
+
+# rotating a token ends the session that used the old one
+cp "$TMP/tokens.good" "$TMP/tokens"
+kill -HUP "$auth_PID"
+wait_line "$TMP/auth.log" "3 user(s) loaded"
+client -u bot1 -k t0k -w 3 >"$TMP/rot.out" &
+ROT=$!
+wait_line "$TMP/rot.out" "SYSTEM Welcome, bot1!"
+sed -i 's/^bot1 t0k$/bot1 n3w/' "$TMP/tokens"
+kill -HUP "$auth_PID"
+wait $ROT
+expect "rotating a token ends the old session" "$TMP/rot.out" "ERROR 9 Your token is no longer valid"
+client -u bot1 -k n3w -w 0.2 >"$TMP/rot2.out"
+expect "the new token works right away" "$TMP/rot2.out" "SYSTEM Welcome, bot1!"
 stop_server auth
 
+: >"$TMP/empty-tokens"
+if "$SERVER" -p $((BASE_PORT + 2)) -t "$TMP/empty-tokens" 2>"$TMP/empty.log"; then
+    fail "server refuses to start with an empty tokens file"
+else
+    pass "server refuses to start with an empty tokens file"
+fi
+
 PORT=$((BASE_PORT + 3))
-start_server authall "$PORT" -t "$TMP/tokens" -A
+start_server authall "$PORT" -t "$TMP/tokens.good" -A
 client -u erin -w 0.2 >"$TMP/auth7.out"
 expect "-A refuses unlisted names" "$TMP/auth7.out" "ERROR 9 "
 client -u bot1 -k t0k -w 0.2 >"$TMP/auth8.out"
@@ -631,10 +665,11 @@ else
     fail "history survives a restart"; sed 's/^/       /' "$TMP/store2.out"
 fi
 new_id=$(awk '/^SENT/{print $2}' "$TMP/store2.out")
-if [ -n "$new_id" ] && [ -n "$last_id" ] && [ "$new_id" -eq $((last_id + 1)) ]; then
-    pass "message ids continue after a restart"
+# ids are reserved in blocks, so after a restart they keep increasing but may skip
+if [ -n "$new_id" ] && [ -n "$last_id" ] && [ "$new_id" -gt "$last_id" ]; then
+    pass "message ids keep increasing after a restart"
 else
-    fail "message ids continue after a restart ($last_id then $new_id)"
+    fail "message ids keep increasing after a restart ($last_id then $new_id)"
 fi
 # paging back with before_id
 raw >"$TMP/page.out" <<'PY2'
@@ -669,9 +704,13 @@ texts = []
 for _ in range(n):
     ln = struct.unpack(">H", p[:2])[0]; texts.append(p[2:2 + ln]); p = p[2 + ln:]
 print("page2", " ".join(text(e) for e in texts))
+c.send(frame(0x0B, s8(b"#keep") + struct.pack(">QH", 0xFFFFFFFFFFFFFFFF, 2)))
+f = c.wait_for(0x1B)
+print("huge-before-id", struct.unpack(">H", f[1][6:8])[0])
 PY2
 expect "history pages newest first" "$TMP/page.out" "page1 three four"
 expect "before_id pages further back" "$TMP/page.out" "page2 one two"
+expect "a huge before_id means latest" "$TMP/page.out" "huge-before-id 2"
 stop_server store2
 
 if [ "$FAILED" -ne 0 ]; then

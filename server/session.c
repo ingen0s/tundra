@@ -256,6 +256,23 @@ void sessions_expire(void) {
     }
 }
 
+void sessions_recheck_auth(void) {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        Session *s = &sessions[i];
+        if (s->state == SESSION_FREE) continue;
+        TundraBytes tok = { s->auth_token, s->auth_token_len };
+        if (auth_check(s->username, s->auth_token_len ? &tok : NULL)) continue;
+        log_info("%s no longer passes authentication; ending the session", s->username);
+        if (s->state == SESSION_ACTIVE && s->client) {
+            Client *c = s->client;
+            send_error(c, 0, ERR_UNAUTHORIZED, "Your token is no longer valid");
+            close_after_flush(c);
+            if (!c->dead) mark_dead(c); /* detach now; queued bytes are flushed best-effort */
+        }
+        release_session(s);
+    }
+}
+
 void sessions_ping(void) {
     uint8_t buf[8];
     tundra_put_u64(buf, wall_ms());

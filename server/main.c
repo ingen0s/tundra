@@ -62,13 +62,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "-A needs -t\n");
         return 1;
     }
+    /* before anything slow, so an early SIGHUP cannot kill the process */
+    struct sigaction sa = {0};
+    sa.sa_handler = on_hup;
+    sigaction(SIGHUP, &sa, NULL);
     if (tokens_path && auth_init(tokens_path) < 0) return 1;
     if (db_path && store_open(db_path) < 0) return 1;
 
     if (net_listen(port) < 0) return 1;
-    struct sigaction sa = {0};
-    sa.sa_handler = on_hup;
-    sigaction(SIGHUP, &sa, NULL);
     log_info("Tundra server listening on port %d", port);
 
     last_ping = mono_s();
