@@ -1,0 +1,8 @@
+{
+  "name": "tundra-web-ui-test",
+  "private": true,
+  "description": "Drives the bundled web client in jsdom against a live server",
+  "dependencies": {
+    "jsdom": "^24.1.0"
+  }
+}

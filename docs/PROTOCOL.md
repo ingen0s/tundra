@@ -21,6 +21,11 @@ A frame is always exactly `7 + length` bytes, so the largest frame is 65542 byte
 
 **Strictness.** Every payload must be exactly the size its fields describe. Missing or trailing bytes get `ERR_INVALID_FORMAT`. A frame with an unknown version gets an error and the connection is closed.
 
+## Transports
+
+- **TCP** (default port 4242): frames are written back to back on the stream.
+- **WebSocket** (`-w PORT`, path `/ws`): each binary WebSocket message carries exactly one Tundra frame, in both directions. Client messages must be unfragmented binary messages (what browsers send); text messages are refused with close code 1003, unmasked or extension frames with 1002, and messages larger than one frame with 1009. WebSocket ping/pong is answered, but the Tundra `PING`/`PONG` still applies. The same port serves the bundled web client at `/`.
+
 ## Field notation
 
 | Notation | Meaning |

@@ -23,8 +23,11 @@ all: $(SERVER) $(CLIENT) $(CODEC_T)
 $(BUILD):
 	mkdir -p $(BUILD)
 
-$(SERVER): $(SERVER_SRC) server/server.h $(CODEC) $(HEADERS) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ $(SERVER_SRC) $(CODEC) $(LDLIBS) -lsqlite3
+$(BUILD)/web_index.h: web/index.html tools/embed.py | $(BUILD)
+	python3 tools/embed.py web/index.html $@ web_index_html
+
+$(SERVER): $(SERVER_SRC) server/server.h $(CODEC) $(HEADERS) $(BUILD)/web_index.h | $(BUILD)
+	$(CC) $(CFLAGS) -I$(BUILD) -o $@ $(SERVER_SRC) $(CODEC) $(LDLIBS) -lsqlite3
 
 $(CLIENT): test_client.c $(CODEC) $(HEADERS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ test_client.c $(CODEC) $(LDLIBS)

@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tundra</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1d2330; --muted: #6b7385; --line: #e3e6ec;
+    --accent: #2f6fde; --accent-ink: #ffffff; --mine: #e9f0fd; --warn: #b3261e; --sys: #5d6577;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --panel: #1a1e26; --ink: #e6e9ef; --muted: #8d95a6; --line: #2a303b;
+      --accent: #6b9cff; --accent-ink: #0d1117; --mine: #1f2b42; --warn: #ff8a80; --sys: #9aa3b5;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
+  button, input, select, textarea { font: inherit; color: inherit; }
+  button { background: var(--accent); color: var(--accent-ink); border: 0; border-radius: 6px; padding: 7px 12px; cursor: pointer; }
+  button.ghost { background: transparent; color: var(--muted); padding: 4px 6px; }
+  input, select, textarea { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; min-width: 0; }
+  .hidden { display: none !important; }
+
+  #login { max-width: 360px; margin: 12vh auto; padding: 24px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  #login h1 { margin: 0 0 4px; font-size: 22px; }
+  #login p { margin: 0 0 18px; color: var(--muted); }
+  #login label { display: block; margin: 10px 0 4px; font-size: 13px; color: var(--muted); }
+  #login input { width: 100%; }
+  #login button { margin-top: 16px; width: 100%; }
+  #login .error { color: var(--warn); margin-top: 10px; min-height: 1.2em; }
+
+  #app { display: grid; grid-template-columns: 240px 1fr; height: 100vh; }
+  #side { border-right: 1px solid var(--line); background: var(--panel); overflow-y: auto; padding: 12px; }
+  #side h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 16px 0 6px; }
+  #side h2:first-child { margin-top: 0; }
+  .item { display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
+  .item:hover { background: var(--bg); }
+  .item.active { background: var(--mine); }
+  .badge { font-size: 12px; background: var(--accent); color: var(--accent-ink); border-radius: 9px; padding: 0 6px; }
+  .row { display: flex; gap: 6px; margin-top: 6px; }
+  .row input { flex: 1; }
+  #status { font-size: 12px; color: var(--muted); margin-top: 16px; word-break: break-all; }
+
+  #main { display: flex; flex-direction: column; min-width: 0; }
+  #head { padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: baseline; gap: 10px; }
+  #head strong { font-size: 17px; }
+  #head span { color: var(--muted); font-size: 13px; }
+  #log { flex: 1; overflow-y: auto; padding: 12px 16px; }
+  .msg { margin: 6px 0; max-width: 760px; }
+  .msg .who { font-weight: 600; margin-right: 6px; }
+  .msg .when { color: var(--muted); font-size: 12px; margin-left: 6px; }
+  .msg .text { white-space: pre-wrap; word-wrap: break-word; }
+  .msg.mine .text { background: var(--mine); border-radius: 8px; padding: 2px 8px; display: inline-block; }
+  .msg.sys { color: var(--sys); font-size: 13px; }
+  .msg.err { color: var(--warn); font-size: 13px; }
+  .msg.agent .text { border-left: 3px solid var(--accent); padding-left: 8px; display: block; }
+  #compose { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); }
+  #compose textarea { flex: 1; resize: none; height: 42px; }
+
+  @media (max-width: 700px) {
+    #app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+    #side { border-right: 0; border-bottom: 1px solid var(--line); max-height: 38vh; }
+  }
+</style>
+</head>
+<body>
+
+<form id="login">
+  <h1>Tundra</h1>
+  <p>Chat and agents over one small protocol.</p>
+  <label for="name">Username</label>
+  <input id="name" autocomplete="username" required maxlength="32" pattern="[!-~]+" placeholder="letters, digits, no spaces">
+  <label for="token">Token (only if your server requires one)</label>
+  <input id="token" type="password" autocomplete="current-password">
+  <button type="submit">Connect</button>
+  <div class="error" id="loginError"></div>
+</form>
+
+<div id="app" class="hidden">
+  <aside id="side">
+    <h2>Rooms</h2>
+    <div id="rooms"></div>
+    <div class="row"><input id="joinName" placeholder="#room"><button id="joinBtn" type="button">Join</button></div>
+    <h2>Direct messages</h2>
+    <div id="dms"></div>
+    <div class="row"><input id="dmName" placeholder="username"><button id="dmBtn" type="button">Open</button></div>
+    <h2>Agents <button class="ghost" id="refreshAgents" type="button" title="Refresh">refresh</button></h2>
+    <div id="agents"></div>
+    <div id="status"></div>
+  </aside>
+  <main id="main">
+    <div id="head"><strong id="title"></strong><span id="subtitle"></span></div>
+    <div id="log"></div>
+    <form id="compose">
+      <textarea id="text" placeholder="Message"></textarea>
+      <button type="submit">Send</button>
+    </form>
+  </main>
+</div>
+
+<script>
+"use strict";
+/* ---------- protocol ---------- */
+const T = {
+  REGISTER: 0x01, PONG: 0x04, JOIN: 0x06, LEAVE: 0x07, SEND: 0x08, HISTORY: 0x0B, ACK: 0x0A,
+  AGENT_REQUEST: 0x21, LIST_AGENTS: 0x23,
+  SYSTEM: 0x10, PING: 0x14, ERROR: 0x15, CHAT: 0x17, SENT: 0x18, ROOM_EVENT: 0x1A, HISTORY_RESULT: 0x1B,
+  AGENT_LIST: 0x30, AGENT_RESPONSE_IN: 0x32,
+};
+const enc = new TextEncoder(), dec = new TextDecoder();
+
+class Writer {
+  constructor() { this.parts = []; this.len = 0; }
+  bytes(b) { this.parts.push(b); this.len += b.length; return this; }
+  u8(v) { return this.bytes(Uint8Array.of(v)); }
+  u16(v) { return this.bytes(Uint8Array.of(v >> 8, v & 255)); }
+  u64(v) { const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, BigInt(v)); return this.bytes(b); }
+  str8(s) { const b = typeof s === "string" ? enc.encode(s) : s; return this.u8(b.length).bytes(b); }
+  str16(s) { const b = typeof s === "string" ? enc.encode(s) : s; return this.u16(b.length).bytes(b); }
+  done() { const out = new Uint8Array(this.len); let o = 0; for (const p of this.parts) { out.set(p, o); o += p.length; } return out; }
+}
+
+class Reader {
+  constructor(bytes) { this.b = bytes; this.v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength); this.p = 0; }
+  u8() { return this.b[this.p++]; }
+  u16() { const v = this.v.getUint16(this.p); this.p += 2; return v; }
+  u64() { const v = this.v.getBigUint64(this.p); this.p += 8; return v; }
+  raw(n) { const s = this.b.subarray(this.p, this.p + n); this.p += n; return s; }
+  str8() { return dec.decode(this.raw(this.u8())); }
+  str16() { return dec.decode(this.raw(this.u16())); }
+  left() { return this.b.length - this.p; }
+}
+
+function readChat(r) {
+  return { id: r.u64(), ts: Number(r.u64()), kind: r.u8(), target: r.str8(), sender: r.str8(), text: r.str16() };
+}
+
+/* ---------- state ---------- */
+const S = {
+  ws: null, me: "", token: "", sessionId: null, lastId: 0n, seq: 0, nextReq: 1,
+  convs: new Map(),          // key -> {kind, name, msgs: [], unread, seen: Set}
+  current: LOBBY_KEY(), agents: [], pending: new Map(), wantClose: false, retry: 0,
+};
+function LOBBY_KEY() { return "#lobby"; }
+const $ = id => document.getElementById(id);
+
+function conv(key) {
+  if (!S.convs.has(key)) S.convs.set(key, { kind: key.startsWith("#") ? 0 : 1, name: key, msgs: [], unread: 0, seen: new Set(), joined: false });
+  return S.convs.get(key);
+}
+
+/* ---------- connection ---------- */
+function send(type, w) {
+  if (!S.ws || S.ws.readyState !== 1) return false;
+  const payload = w ? w.done() : new Uint8Array(0);
+  const frame = new Uint8Array(7 + payload.length);
+  const dv = new DataView(frame.buffer);
+  frame[0] = 1; frame[1] = 0; dv.setUint16(2, S.seq++ & 0xffff); dv.setUint16(4, payload.length); frame[6] = type;
+  frame.set(payload, 7);
+  S.ws.send(frame);
+  return true;
+}
+
+function connect() {
+  const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
+  const ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+  S.ws = ws;
+  setStatus("connecting...");
+  ws.onopen = () => {
+    const w = new Writer().bytes(S.sessionId || new Uint8Array(16)).str8(S.me);
+    if (S.sessionId && S.lastId > 0n) w.u8(0x01).u16(8).u64(S.lastId);  // RESUME_FROM
+    if (S.token) { const t = enc.encode(S.token); w.u8(0x02).u16(t.length).bytes(t); }  // TOKEN
+    send(T.REGISTER, w);
+  };
+  ws.onmessage = ev => onFrame(new Uint8Array(ev.data));
+  ws.onclose = () => {
+    if (S.wantClose) return;
+    S.retry = Math.min(S.retry + 1, 6);
+    const delay = 500 * 2 ** (S.retry - 1);
+    setStatus("disconnected, retrying in " + Math.round(delay / 1000) + "s");
+    setTimeout(connect, delay);
+  };
+}
+
+function onFrame(f) {
+  if (f.length < 7 || f[0] !== 1) return;
+  const type = f[6], seqNo = (f[2] << 8) | f[3], r = new Reader(f.subarray(7));
+  switch (type) {
+    case T.SYSTEM: {
+      const id = r.raw(16), text = r.str16();
+      if (id.some(b => b)) {
+        const resumed = S.sessionId !== null;
+        S.sessionId = id.slice();
+        S.retry = 0;
+        showApp();
+        setStatus("connected as " + S.me);
+        if (!resumed) { conv("#lobby").joined = true; refreshAgents(); }
+        renderSide();
+      }
+      addLine(S.current, { sys: true, text });
+      break;
+    }
+    case T.CHAT: {
+      const m = readChat(r);
+      if (m.id <= S.lastId && conv(keyOf(m)).seen.has(m.id)) break;  // replayed duplicate
+      addChat(m);
+      if (m.id > S.lastId) S.lastId = m.id;
+      scheduleAck();
+      break;
+    }
+    case T.SENT: {
+      const id = r.u64();
+      const p = S.pending.get(seqNo);
+      if (p) { S.pending.delete(seqNo); addChat({ id, ts: Date.now(), kind: p.kind, target: p.target, sender: S.me, text: p.text }); }
+      break;
+    }
+    case T.ROOM_EVENT: {
+      const ev = r.u8(), room = r.str8(), user = r.str8();
+      if (user === S.me) { conv(room).joined = ev === 1; if (ev === 1) loadHistory(room); renderSide(); }
+      addLine(room, { sys: true, text: user + (ev === 1 ? " joined" : " left") });
+      break;
+    }
+    case T.HISTORY_RESULT: {
+      const room = r.str8(); let n = r.u16();
+      while (n-- > 0) { const len = r.u16(); addChat(readChat(new Reader(r.raw(len)))); }
+      break;
+    }
+    case T.AGENT_LIST: {
+      let n = r.u16(); S.agents = [];
+      while (n-- > 0) S.agents.push({ name: r.str8(), online: r.u8() === 1, caps: r.str16() });
+      renderSide();
+      break;
+    }
+    case T.AGENT_RESPONSE_IN: {
+      const agent = r.str8(), req = r.u64(), status = r.u8(), final = r.u8(), body = r.str16();
+      const names = ["ok", "error", "rejected", "timed out", "unavailable"];
+      addLine("@" + agent, { agent: true, who: agent, text: (status ? "[" + (names[status] || status) + "] " : "") + body + (final ? "" : " ...") });
+      break;
+    }
+    case T.PING: send(T.PONG, new Writer().bytes(f.subarray(7))); break;
+    case T.ERROR: {
+      const code = r.u16(), text = r.str16();
+      S.pending.delete(seqNo);
+      if (!S.sessionId) {
+        if (code === 3) { S.sessionId = null; S.lastId = 0n; }  // session gone: register fresh next time
+        $("loginError").textContent = text;
+        S.wantClose = true; S.ws.close();
+        return;
+      }
+      addLine(S.current, { err: true, text: "Error " + code + ": " + text });
+      break;
+    }
+  }
+}
+
+let ackTimer = null;
+function scheduleAck() {
+  if (ackTimer) return;
+  ackTimer = setTimeout(() => { ackTimer = null; send(T.ACK, new Writer().u64(S.lastId)); }, 500);
+}
+
+/* ---------- conversations ---------- */
+function keyOf(m) {
+  if (m.kind === 0) return m.target;
+  return "@" + (m.sender === S.me ? m.target : m.sender);
+}
+
+function addChat(m) {
+  const c = conv(keyOf(m));
+  if (c.seen.has(m.id)) return;
+  c.seen.add(m.id);
+  c.msgs.push({ id: m.id, ts: m.ts, who: m.sender, text: m.text, mine: m.sender === S.me });
+  c.msgs.sort((a, b) => (a.id && b.id ? (a.id < b.id ? -1 : 1) : 0));
+  if (keyOf(m) !== S.current) c.unread++;
+  render();
+}
+
+function addLine(key, line) {
+  const c = conv(key);
+  c.msgs.push(Object.assign({ ts: Date.now() }, line));
+  if (key !== S.current && !line.sys) c.unread++;
+  render();
+}
+
+function loadHistory(room) {
+  send(T.HISTORY, new Writer().str8(room).u64(0).u16(50));
+}
+
+function refreshAgents() { send(T.LIST_AGENTS); }
+
+/* ---------- rendering ---------- */
+function setStatus(t) { $("status").textContent = t; }
+
+function showApp() { $("login").classList.add("hidden"); $("app").classList.remove("hidden"); }
+
+function renderSide() {
+  const rooms = $("rooms"), dms = $("dms"), agents = $("agents");
+  rooms.textContent = ""; dms.textContent = ""; agents.textContent = "";
+  for (const [key, c] of S.convs) {
+    if (c.kind === 0 && !c.joined) continue;
+    const el = document.createElement("div");
+    el.className = "item" + (key === S.current ? " active" : "");
+    const label = document.createElement("span"); label.textContent = key.startsWith("@") ? key.slice(1) : key;
+    el.appendChild(label);
+    if (c.unread) { const b = document.createElement("span"); b.className = "badge"; b.textContent = c.unread; el.appendChild(b); }
+    if (c.kind === 0 && key !== "#lobby") {
+      const x = document.createElement("button"); x.className = "ghost"; x.textContent = "leave"; x.type = "button";
+      x.onclick = e => { e.stopPropagation(); send(T.LEAVE, new Writer().str8(key)); if (S.current === key) select("#lobby"); };
+      el.appendChild(x);
+    }
+    el.onclick = () => select(key);
+    (c.kind === 0 ? rooms : dms).appendChild(el);
+  }
+  for (const a of S.agents) {
+    const el = document.createElement("div");
+    el.className = "item" + ("@" + a.name === S.current ? " active" : "");
+    el.title = a.caps;
+    const label = document.createElement("span"); label.textContent = a.name + (a.online ? "" : " (away)");
+    el.appendChild(label);
+    el.onclick = () => select("@" + a.name);
+    agents.appendChild(el);
+  }
+  if (!S.agents.length) { const n = document.createElement("div"); n.className = "item"; n.style.color = "var(--muted)"; n.textContent = "none online"; agents.appendChild(n); }
+}
+
+function render() {
+  const c = conv(S.current), log = $("log");
+  const isAgent = S.agents.some(a => "@" + a.name === S.current);
+  $("title").textContent = S.current.startsWith("@") ? S.current.slice(1) : S.current;
+  $("subtitle").textContent = isAgent ? "agent: messages here are sent as requests" : (c.kind === 0 ? "room" : "direct messages");
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  log.textContent = "";
+  for (const m of c.msgs) {
+    const el = document.createElement("div");
+    el.className = "msg" + (m.sys ? " sys" : m.err ? " err" : m.agent ? " agent" : "") + (m.mine ? " mine" : "");
+    if (m.who) { const w = document.createElement("span"); w.className = "who"; w.textContent = m.who; el.appendChild(w); }
+    const t = document.createElement("span"); t.className = "text"; t.textContent = m.text; el.appendChild(t);
+    const when = document.createElement("span"); when.className = "when";
+    when.textContent = new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    el.appendChild(when);
+    log.appendChild(el);
+  }
+  if (atBottom) log.scrollTop = log.scrollHeight;
+  renderSide();
+}
+
+function select(key) { S.current = key; conv(key).unread = 0; render(); $("text").focus(); }
+
+/* ---------- actions ---------- */
+$("login").onsubmit = e => {
+  e.preventDefault();
+  $("loginError").textContent = "";
+  S.me = $("name").value.trim(); S.token = $("token").value; S.wantClose = false;
+  if (!/^[!-~]{1,32}$/.test(S.me) || S.me.startsWith("#")) { $("loginError").textContent = "Use 1 to 32 characters, no spaces, not starting with #."; return; }
+  connect();
+};
+
+$("compose").onsubmit = e => {
+  e.preventDefault();
+  const text = $("text").value;
+  if (!text.trim()) return;
+  const key = S.current, isAgent = S.agents.some(a => "@" + a.name === key);
+  if (isAgent) {
+    const name = key.slice(1), id = S.nextReq++;
+    send(T.AGENT_REQUEST, new Writer().str8(name).u64(id).str16(text));
+    addLine(key, { who: S.me, text, mine: true });
+  } else {
+    const kind = key.startsWith("#") ? 0 : 1, target = kind === 0 ? key : key.slice(1);
+    const seqNo = S.seq & 0xffff;
+    if (send(T.SEND, new Writer().u8(kind).str8(target).str16(text))) S.pending.set(seqNo, { kind, target, text });
+  }
+  $("text").value = "";
+};
+
+$("text").addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("compose").requestSubmit(); }
+});
+
+$("joinBtn").onclick = () => {
+  let name = $("joinName").value.trim().toLowerCase();
+  if (!name) return;
+  if (!name.startsWith("#")) name = "#" + name;
+  send(T.JOIN, new Writer().str8(name));
+  $("joinName").value = "";
+  select(name);
+};
+
+$("dmBtn").onclick = () => {
+  const name = $("dmName").value.trim();
+  if (!name) return;
+  $("dmName").value = "";
+  conv("@" + name);
+  select("@" + name);
+};
+
+$("refreshAgents").onclick = refreshAgents;
+</script>
+</body>
+</html>

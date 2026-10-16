@@ -17,8 +17,10 @@ Client clients[MAX_CLIENTS];
 
 static int epoll_fd = -1;
 static int server_fd = -1;
+static int ws_fd = -1;
 static volatile sig_atomic_t running = 1;
-static int listen_marker; /* epoll data.ptr for the listening socket */
+static int listen_marker;    /* epoll data.ptr for the Tundra listener */
+static int ws_listen_marker; /* epoll data.ptr for the HTTP/WebSocket listener */
 
 static void on_signal(int sig) {
     (void)sig;
@@ -95,18 +97,12 @@ void close_after_flush(Client *c) {
     flush_client(c);
 }
 
-void send_frame(Client *c, uint8_t type, uint16_t seq, const uint8_t *payload, size_t len) {
-    if (!c || c->dead || c->fd < 0) return;
-    if (len > TUNDRA_MAX_PAYLOAD) {
-        log_info("refusing to send oversized payload (%zu bytes)", len);
-        return;
-    }
-    size_t need = c->out_len + TUNDRA_HEADER_LEN + len;
+static int reserve(Client *c, size_t need) {
     if (need > MAX_OUTBOUND_BYTES) {
         /* Frames still queued for this client are lost. */
         log_info("fd %d exceeded outbound limit, disconnecting", c->fd);
         mark_dead(c);
-        return;
+        return -1;
     }
     if (need > c->out_cap) {
         size_t cap = c->out_cap ? c->out_cap : 4096;
@@ -114,13 +110,37 @@ void send_frame(Client *c, uint8_t type, uint16_t seq, const uint8_t *payload, s
         uint8_t *p = realloc(c->out, cap);
         if (!p) {
             mark_dead(c);
-            return;
+            return -1;
         }
         c->out = p;
         c->out_cap = cap;
     }
-    tundra_put_header(c->out + c->out_len, type, seq, len);
-    if (len) memcpy(c->out + c->out_len + TUNDRA_HEADER_LEN, payload, len);
+    return 0;
+}
+
+void out_append(Client *c, const uint8_t *data, size_t len) {
+    if (!c || c->dead || c->fd < 0) return;
+    if (reserve(c, c->out_len + len) < 0) return;
+    memcpy(c->out + c->out_len, data, len);
+    c->out_len += len;
+    flush_client(c);
+}
+
+void send_frame(Client *c, uint8_t type, uint16_t seq, const uint8_t *payload, size_t len) {
+    if (!c || c->dead || c->fd < 0) return;
+    if (c->proto == PROTO_HTTP) return; /* not upgraded: no Tundra frames */
+    if (len > TUNDRA_MAX_PAYLOAD) {
+        log_info("refusing to send oversized payload (%zu bytes)", len);
+        return;
+    }
+    uint8_t wshdr[10];
+    size_t wslen = c->proto == PROTO_WS ? ws_header(wshdr, TUNDRA_HEADER_LEN + len) : 0;
+    size_t need = c->out_len + wslen + TUNDRA_HEADER_LEN + len;
+    if (reserve(c, need) < 0) return;
+    if (wslen) memcpy(c->out + c->out_len, wshdr, wslen);
+    size_t at = c->out_len + wslen;
+    tundra_put_header(c->out + at, type, seq, len);
+    if (len) memcpy(c->out + at + TUNDRA_HEADER_LEN, payload, len);
     c->out_len = need;
     if (type == MSG_CHAT && len >= 8) add_mark(c, need, tundra_get_u64(payload));
     if (c->session) c->session->messages_sent++;
@@ -216,6 +236,10 @@ static Client *alloc_client(int fd) {
 /* input                                                               */
 
 static void process_input(Client *c) {
+    if (c->proto != PROTO_TCP) {
+        ws_process_input(c);
+        return;
+    }
     size_t off = 0;
     while (!c->dead && !c->close_after_flush && c->in_len - off >= TUNDRA_HEADER_LEN) {
         size_t plen = tundra_get_u16(c->in + off + 4);
@@ -260,9 +284,9 @@ static void reject_full(int fd) {
     close(fd);
 }
 
-static void accept_clients(void) {
+static void accept_clients(int listen_fd, int proto) {
     for (;;) {
-        int fd = accept4(server_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        int fd = accept4(listen_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) {
             if (errno == EINTR) continue;
             if (errno != EAGAIN && errno != EWOULDBLOCK) log_info("accept failed: %s", strerror(errno));
@@ -271,9 +295,11 @@ static void accept_clients(void) {
         Client *c = alloc_client(fd);
         if (!c) {
             log_info("no free client slots, rejecting fd %d", fd);
-            reject_full(fd);
+            if (proto == PROTO_TCP) reject_full(fd);
+            else close(fd);
             continue;
         }
+        c->proto = proto;
         struct epoll_event ev = {0};
         ev.events = EPOLLIN;
         ev.data.ptr = c;
@@ -290,6 +316,35 @@ static void accept_clients(void) {
 /* ------------------------------------------------------------------ */
 /* setup and loop                                                      */
 
+static int open_listener(int port, void *marker) {
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        perror("socket");
+        return -1;
+    }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((uint16_t)port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(fd, 128) < 0) {
+        perror("bind/listen");
+        close(fd);
+        return -1;
+    }
+    struct epoll_event ev = {0};
+    ev.events = EPOLLIN;
+    ev.data.ptr = marker;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+        perror("epoll_ctl");
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 int net_listen(int port) {
     for (int i = 0; i < MAX_CLIENTS; i++) clients[i].fd = -1;
 
@@ -299,40 +354,18 @@ int net_listen(int port) {
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
-    server_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (server_fd < 0) {
-        perror("socket");
-        return -1;
-    }
-    int one = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons((uint16_t)port);
-    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        return -1;
-    }
-    if (listen(server_fd, 128) < 0) {
-        perror("listen");
-        return -1;
-    }
-
     epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (epoll_fd < 0) {
         perror("epoll_create1");
         return -1;
     }
-    struct epoll_event ev = {0};
-    ev.events = EPOLLIN;
-    ev.data.ptr = &listen_marker;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) < 0) {
-        perror("epoll_ctl");
-        return -1;
-    }
-    return 0;
+    server_fd = open_listener(port, &listen_marker);
+    return server_fd < 0 ? -1 : 0;
+}
+
+int net_listen_ws(int port) {
+    ws_fd = open_listener(port, &ws_listen_marker);
+    return ws_fd < 0 ? -1 : 0;
 }
 
 void net_run(void (*tick)(void)) {
@@ -348,7 +381,11 @@ void net_run(void (*tick)(void)) {
 
         for (int i = 0; i < n; i++) {
             if (events[i].data.ptr == &listen_marker) {
-                accept_clients();
+                accept_clients(server_fd, PROTO_TCP);
+                continue;
+            }
+            if (events[i].data.ptr == &ws_listen_marker) {
+                accept_clients(ws_fd, PROTO_HTTP);
                 continue;
             }
             Client *c = events[i].data.ptr;
@@ -380,4 +417,5 @@ void net_shutdown(void) {
     }
     if (epoll_fd >= 0) close(epoll_fd);
     if (server_fd >= 0) close(server_fd);
+    if (ws_fd >= 0) close(ws_fd);
 }
