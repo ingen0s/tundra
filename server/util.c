@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include <stdarg.h>
 #include <stdio.h>
 
@@ -25,20 +24,9 @@ void log_debug(const char *fmt, ...) {
     fputc('\n', stderr);
 }
 
-static uint64_t clock_ms(clockid_t id) {
-    struct timespec ts;
-    clock_gettime(id, &ts);
-    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
-}
-
-uint64_t wall_ms(void) { return clock_ms(CLOCK_REALTIME); }
-uint64_t mono_ms(void) { return clock_ms(CLOCK_MONOTONIC); }
-
-time_t mono_s(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec;
-}
+uint64_t wall_ms(void) { return plat_wall_ms(); }
+uint64_t mono_ms(void) { return plat_mono_ms(); }
+time_t mono_s(void) { return (time_t)(plat_mono_ms() / 1000u); }
 
 /* 1 to 32 printable ASCII characters, no spaces, not starting with '#'. */
 int valid_username(const uint8_t *name, size_t len) {

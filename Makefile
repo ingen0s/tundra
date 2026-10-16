@@ -3,15 +3,24 @@ CFLAGS  ?= -O2 -g
 # Required flags are appended with `override` so `make CFLAGS=...` cannot drop them.
 override CFLAGS += -std=c11 -Wall -Wextra -Wshadow -Wformat=2 -Werror $(SANFLAGS)
 SANITIZE := -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all
-LDLIBS  += -luuid
+# Per-platform settings. Windows builds use MinGW-w64 (MSYS2).
+ifeq ($(OS),Windows_NT)
+  EXE      := .exe
+  NET_LIBS := -lws2_32 -lbcrypt
+  override CFLAGS += -D__USE_MINGW_ANSI_STDIO=1
+else
+  EXE      :=
+  NET_LIBS :=
+endif
 
 BUILD   := build
-SERVER  := $(BUILD)/tundra_chat_server
-CLIENT  := $(BUILD)/tundra_client
-CODEC_T := $(BUILD)/codec_test
+SERVER  := $(BUILD)/tundra_chat_server$(EXE)
+CLIENT  := $(BUILD)/tundra_client$(EXE)
+CODEC_T := $(BUILD)/codec_test$(EXE)
 FUZZER  := $(BUILD)/fuzz_codec
 HEADERS := tundra_protocol.h tundra_codec.h
 CODEC   := tundra_codec.c
+PLATFORM := tundra_platform.c tundra_platform.h
 SERVER_SRC := $(wildcard server/*.c)
 
 FUZZ_TIME ?= 60
@@ -27,11 +36,11 @@ $(BUILD):
 $(BUILD)/web_index.h: web/index.html tools/embed.py | $(BUILD)
 	python3 tools/embed.py web/index.html $@ web_index_html
 
-$(SERVER): $(SERVER_SRC) server/server.h $(CODEC) $(HEADERS) $(BUILD)/web_index.h | $(BUILD)
-	$(CC) $(CFLAGS) -I$(BUILD) -o $@ $(SERVER_SRC) $(CODEC) $(LDLIBS) -lsqlite3
+$(SERVER): $(SERVER_SRC) server/server.h $(CODEC) $(PLATFORM) $(HEADERS) $(BUILD)/web_index.h | $(BUILD)
+	$(CC) $(CFLAGS) -I$(BUILD) -o $@ $(SERVER_SRC) $(CODEC) tundra_platform.c $(LDFLAGS) -lsqlite3 $(LDLIBS) $(NET_LIBS)
 
-$(CLIENT): test_client.c $(CODEC) $(HEADERS) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ test_client.c $(CODEC) $(LDLIBS)
+$(CLIENT): test_client.c $(CODEC) $(PLATFORM) $(HEADERS) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ test_client.c $(CODEC) tundra_platform.c $(LDFLAGS) $(LDLIBS) $(NET_LIBS)
 
 $(CODEC_T): tests/codec_test.c $(CODEC) $(HEADERS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/codec_test.c $(CODEC)

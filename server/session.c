@@ -10,9 +10,9 @@ int session_index(const Session *s) {
     return (int)(s - sessions);
 }
 
-Session *find_session_by_id(const uuid_t id) {
+Session *find_session_by_id(const tundra_uuid_t id) {
     for (int i = 0; i < MAX_SESSIONS; i++) {
-        if (sessions[i].state != SESSION_FREE && uuid_compare(sessions[i].id, id) == 0) return &sessions[i];
+        if (sessions[i].state != SESSION_FREE && memcmp(sessions[i].id, id, sizeof(tundra_uuid_t)) == 0) return &sessions[i];
     }
     return NULL;
 }
@@ -165,7 +165,7 @@ void session_pump(Session *s) {
     while (s->state == SESSION_ACTIVE && s->client && !s->client->dead) {
         /* the log may have moved on while we were paused: say so, skip ahead */
         if (s->replay_next != 0 && s->replay_next < msglog_first_id()) {
-            static const uuid_t nil = {0};
+            static const tundra_uuid_t nil = {0};
             s->replay_next = msglog_first_id();
             send_system(s->client, 0, nil, "Some earlier messages are no longer available");
             continue;
@@ -204,7 +204,7 @@ void session_pump(Session *s) {
     /* frames dropped while this session was online but behind */
     if (!session_has_pending(s) && s->backlog_dropped && s->state == SESSION_ACTIVE && s->client &&
         !s->client->dead) {
-        static const uuid_t nil = {0};
+        static const tundra_uuid_t nil = {0};
         char msg[96];
         snprintf(msg, sizeof(msg), "%u message(s) were dropped because you fell behind", s->backlog_dropped);
         s->backlog_dropped = 0;
