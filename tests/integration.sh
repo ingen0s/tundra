@@ -711,7 +711,13 @@ PY2
 expect "history pages newest first" "$TMP/page.out" "page1 three four"
 expect "before_id pages further back" "$TMP/page.out" "page2 one two"
 expect "a huge before_id means latest" "$TMP/page.out" "huge-before-id 2"
+# a room deleted before a restart still starts empty after it
+client -u ivy -j "#gone" -t "#gone" -m "from the old room" -L "#gone" -w 0.3 >/dev/null
 stop_server store2
+start_server store3 "$PORT" -d "$TMP/chat.db"
+client -u jay -j "#gone" -y "#gone" -w 0.3 >"$TMP/store3.out"
+expect "a deleted room stays empty after a restart" "$TMP/store3.out" "HISTORY #gone 0"
+stop_server store3
 
 if [ "$FAILED" -ne 0 ]; then
     for log in "$TMP"/*.log; do echo "--- $(basename "$log") ---"; tail -40 "$log"; done
