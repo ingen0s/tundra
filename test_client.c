@@ -12,6 +12,9 @@
  *   -W #room      list members of a room
  *   -y #room      fetch recent history of a room
  *   -c            health check
+ * Options:
+ *   -f id         with -r: resume from this message id instead of the server's watermark
+ *   -a            acknowledge every CHAT received
  * Then everything received is printed for -w seconds (default 1). PINGs are
  * answered automatically.
  *
@@ -51,6 +54,7 @@ typedef struct {
 } Action;
 
 static int sock = -1;
+static int auto_ack = 0;
 static uint16_t next_seq = 0;
 static uint8_t inbuf[TUNDRA_MAX_FRAME];
 static size_t inlen = 0;
@@ -123,6 +127,13 @@ static int handle_frame(const uint8_t *frame, size_t plen) {
             break;
         case MSG_CHAT:
             print_chat("CHAT", &m);
+            if (auto_ack) {
+                TundraMsg ack;
+                memset(&ack, 0, sizeof(ack));
+                ack.type = MSG_ACK;
+                ack.u.sent.id = m.u.chat.id;
+                send_msg(&ack);
+            }
             break;
         case MSG_SENT:
             printf("SENT %llu\n", (unsigned long long)m.u.sent.id);
@@ -271,7 +282,7 @@ static int run_action(const Action *a) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "usage: %s -u username [-H host] [-p port] [-r session-id]\n"
+            "usage: %s -u username [-H host] [-p port] [-r session-id [-f last-id]] [-a]\n"
             "          [-j #room] [-L #room] [-t target] [-m text] [-R] [-W #room] [-y #room] [-c]\n"
             "          [-w seconds]\n",
             prog);
@@ -282,18 +293,21 @@ int main(int argc, char **argv) {
     const char *port = "4242";
     const char *user = NULL;
     const char *resume = NULL;
+    const char *resume_from = NULL;
     const char *target = "#lobby";
     Action actions[MAX_ACTIONS];
     int nactions = 0;
     double wait_s = 1.0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "H:p:u:r:j:L:t:m:RW:y:cw:h")) != -1) {
+    while ((opt = getopt(argc, argv, "H:p:u:r:f:aj:L:t:m:RW:y:cw:h")) != -1) {
         switch (opt) {
             case 'H': host = optarg; break;
             case 'p': port = optarg; break;
             case 'u': user = optarg; break;
             case 'r': resume = optarg; break;
+            case 'f': resume_from = optarg; break;
+            case 'a': auto_ack = 1; break;
             case 't': target = optarg; break;
             case 'w': wait_s = atof(optarg); break;
             case 'j': case 'L': case 'm': case 'R': case 'W': case 'y': case 'c':
@@ -319,6 +333,15 @@ int main(int argc, char **argv) {
     if (resume && uuid_parse(resume, reg.u.reg.id) != 0) {
         fprintf(stderr, "invalid session id: %s\n", resume);
         return 2;
+    }
+    uint8_t ext[16];
+    if (resume_from) {
+        uint8_t v[8];
+        tundra_put_u64(v, strtoull(resume_from, NULL, 10));
+        TundraWriter w = tundra_writer(ext, sizeof(ext));
+        tundra_wr_tlv(&w, REG_RESUME_FROM, v, sizeof(v));
+        reg.u.reg.ext.p = ext;
+        reg.u.reg.ext.len = w.len;
     }
 
     sock = connect_to(host, port);

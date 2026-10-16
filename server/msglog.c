@@ -67,6 +67,10 @@ uint64_t msglog_last_id(void) {
     return next_id - 1;
 }
 
+uint64_t msglog_first_id(void) {
+    return first_id;
+}
+
 void msglog_to_chat(const LoggedMessage *m, TundraMsg *out) {
     memset(out, 0, sizeof(*out));
     out->type = MSG_CHAT;

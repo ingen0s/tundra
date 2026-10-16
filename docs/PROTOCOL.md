@@ -41,7 +41,7 @@ Text is UTF-8 by convention; the server does not inspect it. Chat text is limite
 
 | Type | Code | Payload |
 |------|------|---------|
-| `REGISTER` | 0x01 | `id16 id` `str8 username`. Must be sent within 10 seconds of connecting. |
+| `REGISTER` | 0x01 | `id16 id` `str8 username`, then optional extensions (see below). Must be sent within 10 seconds of connecting. |
 | `MESSAGE` | 0x02 | `str16 text`. Shorthand for `SEND` to `#lobby`. |
 | `AGENT_COMMAND` | 0x03 | `str8 agent` `str16 command`. Legacy; broadcast to `#lobby` as `BROADCAST_AGENT`. |
 | `PONG` | 0x04 | echo of the `PING` payload. Required: it keeps the connection alive and latency is computed from the echoed timestamp. |
@@ -50,6 +50,7 @@ Text is UTF-8 by convention; the server does not inspect it. Chat text is limite
 | `LEAVE` | 0x07 | `str8 room` |
 | `SEND` | 0x08 | `u8 kind` `str8 target` `str16 text`. Kind 0 = room (target is a room), 1 = direct (target is a username). |
 | `LIST_ROOMS` | 0x09 | empty |
+| `ACK` | 0x0A | `u64 id`: every `CHAT` up to and including `id` has been processed. Cumulative; optional. |
 | `HISTORY` | 0x0B | `str8 room` `u64 before_id` `u16 limit`. `before_id` 0 means "latest". `limit` 0 or over 100 means 100. |
 | `WHO` | 0x0C | `str8 room` |
 
@@ -73,14 +74,37 @@ Text is UTF-8 by convention; the server does not inspect it. Chat text is limite
 
 Message ids are assigned by the server, are unique, and increase by one per message across all rooms and direct messages.
 
+## REGISTER extensions
+
+After the username, `REGISTER` may carry any number of extensions, each `u8 tag` `u16 len` `len bytes`. Unknown tags are ignored, so clients can send newer extensions to older servers.
+
+| Tag | Name | Value |
+|-----|------|-------|
+| 0x01 | `RESUME_FROM` | `u64`: the newest `CHAT` id the client already has. On resume, everything after it is replayed. |
+| 0x02 | `TOKEN` | reserved for authentication |
+
 ## Sessions
 
 1. `REGISTER` with an all-zero id. The welcome `SYSTEM` frame carries your session id, and you are joined to `#lobby` (you get a `ROOM_EVENT` for it).
-2. If the connection drops, the session, its username and its room memberships are held for 2 minutes. Frames for it are buffered: up to 50 frames and 1 MiB per session (64 MiB across the server), oldest dropped first.
-3. `REGISTER` with the same id and username to resume. The welcome comes first, then a `SYSTEM` notice if anything was dropped, then the backlog, paced so it never overflows the connection. If a connected client falls behind far enough that frames are dropped, it gets a similar notice once it catches up. If the old connection is still open it is closed. An unknown or expired id, or someone else's id, gets `SESSION_EXPIRED`: register again with a zero id.
+2. If the connection drops, the session, its username and its room memberships are held for 2 minutes.
+3. `REGISTER` with the same id and username to resume. The welcome comes first, then any `SYSTEM` notices about dropped frames or messages no longer available, then the catch-up described below. If the old connection is still open it is closed. An unknown or expired id, or someone else's id, gets `SESSION_EXPIRED`: register again with a zero id.
 4. After the hold period the session is released, its username becomes free, and each of its rooms gets a "left" event. When the session table is full, the longest-detached session is released early to make room.
 
-Registered connections that send nothing for 2 minutes are dropped; the server pings every 30 seconds, so answering with `PONG` is enough. Each client's outgoing queue is capped at 1 MiB; a client that falls further behind is disconnected and loses what was still queued for it.
+### Catching up after a resume
+
+Chat messages are never buffered per session. Instead, a resumed session is caught up from the server's message log, in id order, starting after the first of these that applies:
+
+1. the `RESUME_FROM` extension, if the client sent one;
+2. the highest id the client has `ACK`ed, if it ever sent an `ACK`;
+3. the highest id the server fully wrote to the previous connection.
+
+Option 3 is a good default, but bytes written just before a connection drops can still be lost in transit, so a client that must not miss anything should either `ACK` or send `RESUME_FROM`. Replay can repeat messages the client already has (for example after `RESUME_FROM` with an old id); ids are unique and increasing, so clients should ignore any `CHAT` whose id they have already seen.
+
+Only messages the session would have received are replayed: messages sent after it joined each room it is in now, and direct messages to it sent after the session was created; never its own, and never anything from before the session existed (whatever `RESUME_FROM` says). If the log no longer holds part of the range (it keeps 10,000 messages / 64 MiB), including when the log moves on during a slow catch-up, a `SYSTEM` notice says "Some earlier messages are no longer available" and replay continues from the oldest message still held. A `RESUME_FROM` value that is not 8 bytes is refused with `INVALID_FORMAT`.
+
+Other frames (room events, notices) that arrive while a session is away, or while it is still catching up, are buffered: up to 50 frames and 1 MiB per session (64 MiB across the server), oldest dropped first, with a `SYSTEM` notice of how many were dropped. Each is delivered in its place among the replayed chats, right after the last message that came before it.
+
+All catch-up is paced: it is sent only while the connection has less than 256 KiB queued, so a long catch-up never trips the 1 MiB output limit. New messages that arrive meanwhile are delivered after it, in order.
 
 ## Rooms
 

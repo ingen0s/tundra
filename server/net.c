@@ -36,6 +36,32 @@ static void set_epollout(Client *c, int on) {
     if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, c->fd, &ev) == 0) c->want_write = on;
 }
 
+/* Records that a CHAT frame ending at `end` in the output queue carries
+ * `id`. When the table is full the oldest mark is dropped, which only makes
+ * the written watermark more conservative. */
+static void add_mark(Client *c, size_t end, uint64_t id) {
+    if (c->marks_count == MAX_WRITE_MARKS) {
+        c->marks_head = (c->marks_head + 1) % MAX_WRITE_MARKS;
+        c->marks_count--;
+    }
+    size_t i = (c->marks_head + c->marks_count) % MAX_WRITE_MARKS;
+    c->marks[i].end = end;
+    c->marks[i].id = id;
+    c->marks_count++;
+}
+
+/* `sent` bytes left the queue: every CHAT frame that ended within them is
+ * now written, and the remaining marks shift down. */
+static void advance_marks(Client *c, size_t sent) {
+    while (c->marks_count > 0 && c->marks[c->marks_head].end <= sent) {
+        uint64_t id = c->marks[c->marks_head].id;
+        if (c->session && id > c->session->written_id) c->session->written_id = id;
+        c->marks_head = (c->marks_head + 1) % MAX_WRITE_MARKS;
+        c->marks_count--;
+    }
+    for (size_t i = 0; i < c->marks_count; i++) c->marks[(c->marks_head + i) % MAX_WRITE_MARKS].end -= sent;
+}
+
 static void flush_client(Client *c) {
     size_t off = 0;
     while (off < c->out_len && !c->dead) {
@@ -52,11 +78,12 @@ static void flush_client(Client *c) {
     if (off > 0) {
         memmove(c->out, c->out + off, c->out_len - off);
         c->out_len -= off;
+        advance_marks(c, off);
     }
     if (c->dead) return;
-    /* room freed up: continue any backlog replay */
-    if (c->session && c->session->backlog_count > 0 && c->out_len < REPLAY_HIGH_WATER) {
-        backlog_pump(c->session);
+    /* room freed up: continue any backlog or chat replay */
+    if (c->session && session_has_pending(c->session) && c->out_len < REPLAY_HIGH_WATER) {
+        session_pump(c->session);
         if (c->dead) return;
     }
     set_epollout(c, c->out_len > 0);
@@ -95,6 +122,7 @@ void send_frame(Client *c, uint8_t type, uint16_t seq, const uint8_t *payload, s
     tundra_put_header(c->out + c->out_len, type, seq, len);
     if (len) memcpy(c->out + c->out_len + TUNDRA_HEADER_LEN, payload, len);
     c->out_len = need;
+    if (type == MSG_CHAT && len >= 8) add_mark(c, need, tundra_get_u64(payload));
     if (c->session) c->session->messages_sent++;
     log_debug("-> fd %d %s seq %u len %zu", c->fd, tundra_type_name(type), seq, len);
     flush_client(c);

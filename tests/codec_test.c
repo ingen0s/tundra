@@ -93,6 +93,30 @@ int main(void) {
 
     CHECK(tundra_decode(0x7f, buf, 0, &out) == TUNDRA_DECODE_UNKNOWN, "unknown type reported");
 
+    /* REGISTER with TLV extensions */
+    {
+        uint8_t ext[64];
+        TundraWriter xw = tundra_writer(ext, sizeof(ext));
+        uint8_t from[8];
+        tundra_put_u64(from, 41);
+        tundra_wr_tlv(&xw, REG_RESUME_FROM, from, sizeof(from));
+        tundra_wr_tlv(&xw, 0x7f, "x", 1); /* unknown tags are carried and ignored */
+        memset(&in, 0, sizeof(in));
+        in.type = MSG_REGISTER;
+        in.u.reg.username = str("alice");
+        in.u.reg.ext.p = ext;
+        in.u.reg.ext.len = xw.len;
+        n = tundra_encode(&in, buf, sizeof(buf));
+        CHECK(n == 16 + 6 + 11 + 4, "register with extensions encodes");
+        TundraBytes v = {0};
+        CHECK(tundra_decode(MSG_REGISTER, buf, (size_t)n, &out) == TUNDRA_DECODE_OK &&
+              tundra_reg_find(out.u.reg.ext, REG_RESUME_FROM, &v) && v.len == 8 && tundra_get_u64(v.p) == 41,
+              "resume point found in extensions");
+        CHECK(!tundra_reg_find(out.u.reg.ext, REG_TOKEN, &v), "absent tag not found");
+        CHECK(tundra_decode(MSG_REGISTER, buf, (size_t)n - 1, &out) == TUNDRA_DECODE_MALFORMED,
+              "truncated extension rejected");
+    }
+
     /* CHAT round trip */
     TundraMsg chat;
     memset(&chat, 0, sizeof(chat));

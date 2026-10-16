@@ -40,7 +40,7 @@
  * 0x10-0x1F and 0x30-0x3F are server -> client. */
 enum TundraMessageType {
     /* client -> server */
-    MSG_REGISTER          = 0x01, /* id(16) ulen(1) username(ulen)                    */
+    MSG_REGISTER          = 0x01, /* id(16) ulen(1) username [TLV extensions]         */
     MSG_MESSAGE           = 0x02, /* mlen(2) text: shorthand for SEND to #lobby       */
     MSG_AGENT_COMMAND     = 0x03, /* alen(1) agent clen(2) command                    */
     MSG_PONG              = 0x04, /* echo of the PING payload; keeps the connection alive */
@@ -49,6 +49,7 @@ enum TundraMessageType {
     MSG_LEAVE             = 0x07, /* rlen(1) room                                     */
     MSG_SEND              = 0x08, /* kind(1) tlen(1) target mlen(2) text              */
     MSG_LIST_ROOMS        = 0x09, /* empty                                            */
+    MSG_ACK               = 0x0A, /* id(8): every CHAT up to and including id is processed */
     MSG_HISTORY           = 0x0B, /* rlen(1) room before_id(8) limit(2)               */
     MSG_WHO               = 0x0C, /* rlen(1) room                                     */
 
@@ -70,6 +71,13 @@ enum TundraMessageType {
                                      [len(2) CHAT payload], oldest first              */
     MSG_WHO_RESULT        = 0x1C  /* rlen(1) room count(2) then count x
                                      [ulen(1) user online(1)]                         */
+};
+
+/* REGISTER extensions: zero or more TLVs after the username,
+ * each tag(1) len(2) value(len). Unknown tags are ignored. */
+enum TundraRegisterTag {
+    REG_RESUME_FROM = 0x01, /* u64: last CHAT id the client has; replay everything after it */
+    REG_TOKEN       = 0x02  /* bytes: authentication token (reserved)                      */
 };
 
 enum TundraChatKind {

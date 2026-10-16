@@ -145,8 +145,7 @@ wait $HUGO
 expect "takeover resumes the session" "$TMP/hugo2.out" "SYSTEM Welcome back, hugo!"
 expect "takeover closes the old connection" "$TMP/hugo1.out" "CLOSED"
 
-# 8. backlog keeps the newest 50 frames and says how many were dropped
-#    (iris's backlog gets jack's join event, then 60 messages)
+# 8. catch-up is not limited to a fixed backlog: all 60 missed messages arrive
 client -u iris -w 0 >"$TMP/iris1.out"
 IRIS_ID="$(awk '/^SESSION/{print $2; exit}' "$TMP/iris1.out")"
 args=()
@@ -156,12 +155,80 @@ client -u iris -r "$IRIS_ID" -w 0.5 >"$TMP/iris2.out"
 count=$(grep -c '^CHAT .* jack ' "$TMP/iris2.out")
 first=$(grep -m1 '^CHAT .* jack ' "$TMP/iris2.out" | awk '{print $5}')
 last=$(grep '^CHAT .* jack ' "$TMP/iris2.out" | tail -1 | awk '{print $5}')
-if [ "$count" -eq 50 ] && [ "$first" = "m11" ] && [ "$last" = "m60" ]; then
-    pass "backlog keeps the newest 50"
+if [ "$count" -eq 60 ] && [ "$first" = "m1" ] && [ "$last" = "m60" ]; then
+    pass "resume replays every missed message in order"
 else
-    fail "backlog keeps the newest 50 (got $count, $first..$last)"
+    fail "resume replays every missed message in order (got $count, $first..$last)"
 fi
-expect "dropped frames are reported" "$TMP/iris2.out" "SYSTEM 11 buffered message(s) were dropped while you were away"
+expect "events buffered while away are delivered" "$TMP/iris2.out" "EVENT joined #lobby jack"
+
+# 8b. ACKs and resume points
+raw >"$TMP/ack.out" <<'PY'
+import sys, struct
+from tundra_raw import *
+port = int(sys.argv[1])
+
+def chat_id(p):
+    return struct.unpack(">Q", p[:8])[0]
+
+def chats(conn, n):
+    ids = []
+    while len(ids) < n:
+        f = conn.wait_for(0x17)
+        if not f:
+            break
+        ids.append(chat_id(f[1]))
+    return ids
+
+listener = Conn(port)
+listener.send(register(b"ackuser"))
+sid = listener.wait_for(0x10)[1][:16]
+talker = Conn(port)
+talker.send(register(b"acktalker"))
+talker.wait_for(0x10)
+for i in range(5):
+    talker.send(frame(0x02, s16(b"a%d" % i)))
+got = chats(listener, 5)
+print("received", len(got))
+# acknowledge only the first two, then drop the connection
+listener.send(frame(0x0A, struct.pack(">Q", got[1])))
+listener.sock.close()
+
+# resume without a resume point: the server continues after the last ACK
+r = Conn(port)
+r.send(register(b"ackuser", sid))
+r.wait_for(0x10)
+again = chats(r, 3)
+print("after-ack", " ".join(str(i - got[0]) for i in again))
+r.sock.close()
+
+# resume with an explicit point: replay everything after it
+r = Conn(port)
+r.send(frame(0x01, sid + s8(b"ackuser") + bytes([0x01]) + struct.pack(">H", 8) + struct.pack(">Q", got[0])))
+r.wait_for(0x10)
+again = chats(r, 4)
+print("after-point", " ".join(str(i - got[0]) for i in again))
+r.sock.close()
+
+# without ACKs, the server continues after what it fully wrote
+q = Conn(port)
+q.send(register(b"noacker"))
+qsid = q.wait_for(0x10)[1][:16]
+talker.send(frame(0x02, s16(b"before")))
+q.wait_for(0x17)
+q.sock.close()
+talker.send(frame(0x02, s16(b"after")))
+talker.wait_for(0x18)
+q = Conn(port)
+q.send(register(b"noacker", qsid))
+q.wait_for(0x10)
+f = q.wait_for(0x17, 1.0)
+print("no-ack-resume", f[1][-5:].decode() if f else None, "dup" if q.wait_for(0x17, 0.3) else "nodup")
+PY
+expect "listener got the messages" "$TMP/ack.out" "received 5"
+expect "resume continues after the last ACK" "$TMP/ack.out" "after-ack 2 3 4"
+expect "resume point replays after it" "$TMP/ack.out" "after-point 1 2 3 4"
+expect "without ACKs resume continues after what was written" "$TMP/ack.out" "no-ack-resume after nodup"
 
 # 9. a backlog larger than the output limit is replayed in full, not cut off
 client -u kate -w 0 >"$TMP/kate1.out"
@@ -368,7 +435,7 @@ b.send(frame(0x0B, s8(b"#reuse") + struct.pack(">QH", 0, 10)))
 f = b.wait_for(0x1B)
 print("recreated-room-history", struct.unpack(">H", f[1][7:9])[0] if f else None)
 
-# resume order: welcome, then the drop notice, then the backlog
+# resume order: the welcome comes before the catch-up
 r = Conn(port)
 r.send(register(b"orderly"))
 sid = r.wait_for(0x10)[1][:16]
@@ -398,7 +465,41 @@ PY
 expect "a maximum-size message is accepted" "$TMP/roomfix.out" "max-message-sent True"
 expect "a maximum-size message fits in HISTORY" "$TMP/roomfix.out" "max-message-in-history 1"
 expect "a recreated room has no old history" "$TMP/roomfix.out" "recreated-room-history 0"
-expect "resume sends welcome, drop notice, then backlog" "$TMP/roomfix.out" "resume-order welcome notice chat"
+expect "resume sends the welcome, then the catch-up" "$TMP/roomfix.out" "resume-order welcome chat"
+# 18b. catching up past the retained log says so, and still delivers what is held
+raw >"$TMP/gap.out" <<'PY'
+import sys
+from tundra_raw import *
+port = int(sys.argv[1])
+z = Conn(port)
+z.send(register(b"zed"))
+sid = z.wait_for(0x10)[1][:16]
+z.sock.close()
+t = Conn(port)
+t.send(register(b"flooder"))
+t.wait_for(0x10)
+for i in range(10050):
+    t.send(frame(0x02, s16(b"f%d" % i)))
+while t.wait_for(0x18, 0.5):
+    pass
+z = Conn(port)
+z.send(register(b"zed", sid))
+notice = False
+last = None
+count = 0
+while True:
+    f = z.recv_frame()
+    if f is None:
+        break
+    if f[0] == 0x10 and b"no longer available" in f[1]:
+        notice = True
+    if f[0] == 0x17:
+        count += 1
+        last = f[1][-6:]
+print("gap-notice", notice, "count", count, "last", last.decode() if last else None)
+PY
+expect "gap in retained history is reported" "$TMP/gap.out" "gap-notice True"
+expect "catch-up delivers up to the newest message" "$TMP/gap.out" "last f10049"
 
 stop_server main
 
@@ -415,6 +516,77 @@ client -u pia -w 0.3 >"$TMP/pia2.out"
 expect "expired username can be registered again" "$TMP/pia2.out" "SYSTEM Welcome, pia!"
 wait $OWEN
 stop_server expiry
+
+# 18d. catch-up never reaches before the session or the join (short-grace server)
+PORT=$((BASE_PORT + 10))
+start_server catchup "$PORT" -g 1
+raw >"$TMP/catchup2.out" <<'PY'
+import sys, struct, time
+from tundra_raw import *
+port = int(sys.argv[1])
+
+def texts(conn, wait=0.6):
+    out = []
+    while True:
+        f = conn.wait_for(0x17, wait)
+        if not f:
+            return out
+        p = f[1]
+        tl = p[17]; sl = p[18 + tl]; ml = struct.unpack(">H", p[19 + tl + sl:21 + tl + sl])[0]
+        out.append(p[21 + tl + sl:21 + tl + sl + ml].decode())
+
+old = Conn(port)
+old.send(register(b"namesake"))
+old.wait_for(0x10)
+old.sock.close()
+s = Conn(port)
+s.send(register(b"dmsender"))
+s.wait_for(0x10)
+s.send(frame(0x08, bytes([1]) + s8(b"namesake") + s16(b"for the old namesake")))
+s.wait_for(0x18)
+time.sleep(2.5)  # the old session expires
+new = Conn(port)
+new.send(register(b"namesake"))
+nsid = new.wait_for(0x10)[1][:16]
+new.sock.close()
+time.sleep(0.2)
+new = Conn(port)
+new.send(frame(0x01, nsid + s8(b"namesake") + bytes([1]) + struct.pack(">HQ", 8, 0)))  # RESUME_FROM 0
+new.wait_for(0x10)
+print("new-namesake-gets", texts(new))
+
+# a room joined later does not replay messages from before the join
+a = Conn(port)
+a.send(register(b"joiner"))
+asid = a.wait_for(0x10)[1][:16]
+t = Conn(port)
+t.send(register(b"roomtalker"))
+t.wait_for(0x10)
+t.send(frame(0x06, s8(b"#later")))
+t.wait_for(0x1A)
+t.send(frame(0x08, bytes([0]) + s8(b"#later") + s16(b"before you joined")))
+t.wait_for(0x18)
+a.send(frame(0x06, s8(b"#later")))
+a.wait_for(0x1A)
+t.send(frame(0x08, bytes([0]) + s8(b"#later") + s16(b"after you joined")))
+t.wait_for(0x18)
+texts(a)
+a.sock.close()
+time.sleep(0.2)
+a = Conn(port)
+a.send(frame(0x01, asid + s8(b"joiner") + bytes([1]) + struct.pack(">HQ", 8, 0)))
+a.wait_for(0x10)
+print("joiner-replay", texts(a))
+
+bad = Conn(port)
+bad.send(frame(0x01, asid + s8(b"joiner") + bytes([1]) + struct.pack(">H", 3) + b"abc"))
+f = bad.wait_for(0x15)
+print("bad-resume-from", error_code(f[1]) if f else None)
+PY
+expect "a reused name gets no direct messages meant for its earlier holder" "$TMP/catchup2.out" "new-namesake-gets []"
+expect "catch-up skips room messages from before the join" "$TMP/catchup2.out" "joiner-replay ['after you joined']"
+expect "a RESUME_FROM that is not 8 bytes is refused" "$TMP/catchup2.out" "bad-resume-from 2"
+stop_server catchup
 
 if [ "$FAILED" -ne 0 ]; then
     for log in "$TMP"/*.log; do echo "--- $(basename "$log") ---"; tail -40 "$log"; done
