@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y uuid-dev libsqlite3-dev
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
       - name: Build
         run: |
           if [ "${{ matrix.build }}" = "asan" ]; then make asan; else make; fi
@@ -22,6 +22,8 @@ jobs:
         run: ./build/codec_test
       - name: Integration tests
         run: ./tests/integration.sh
+      - name: Smoke test
+        run: python3 tests/smoke.py build/tundra_chat_server
 
   fuzz:
     # pinned so clang and libclang-rt-18-dev stay the same version
@@ -51,9 +53,59 @@ jobs:
           node-version: 22
       - name: Install dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y uuid-dev libsqlite3-dev
+          sudo apt-get update && sudo apt-get install -y libsqlite3-dev
           cd tests/web && npm install
       - name: Build
         run: make
       - name: Web client in jsdom
         run: ./tests/web_ui.sh
+
+  linux-poll:
+    # the portable poll() backend that Windows uses, exercised on Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - name: Build with the poll() backend and sanitizers
+        run: make all CFLAGS="-O1 -g -DTUNDRA_POLLER_POLL" SANFLAGS="-fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all"
+      - name: Integration tests
+        run: ./tests/integration.sh
+      - name: Smoke test (120 clients, slow reader)
+        run: python3 tests/smoke.py build/tundra_chat_server
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make
+      - name: Codec unit tests
+        run: ./build/codec_test
+      - name: Integration tests
+        run: ./tests/integration.sh
+      - name: Smoke test
+        run: python3 tests/smoke.py build/tundra_chat_server
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-sqlite3
+            mingw-w64-x86_64-python
+      - name: Build
+        run: make
+      - name: Codec unit tests
+        run: ./build/codec_test.exe
+      - name: Smoke test
+        run: python tests/smoke.py build/tundra_chat_server.exe

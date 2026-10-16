@@ -1,16 +1,14 @@
-#define _GNU_SOURCE
 #include <getopt.h>
-#include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #include "server.h"
 
 static time_t last_ping;
-static volatile sig_atomic_t reload_requested = 0;
+static atomic_int reload_requested = 0; /* set from a signal handler */
 
-static void on_hup(int sig) {
-    (void)sig;
+static void on_hup(void) {
     reload_requested = 1;
 }
 
@@ -69,9 +67,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     /* before anything slow, so an early SIGHUP cannot kill the process */
-    struct sigaction sa = {0};
-    sa.sa_handler = on_hup;
-    sigaction(SIGHUP, &sa, NULL);
+    net_handle_signals(on_hup);
     if (tokens_path && auth_init(tokens_path) < 0) return 1;
     if (db_path && store_open(db_path) < 0) return 1;
 
@@ -89,6 +85,7 @@ int main(int argc, char **argv) {
         free(sessions[i].capabilities);
     }
     msglog_free();
+    plat_shutdown_complete();
     store_close();
     auth_free();
     return 0;

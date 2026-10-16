@@ -628,7 +628,7 @@ wait_line "$TMP/auth.log" "3 user(s) loaded"
 client -u bot1 -k t0k -w 3 >"$TMP/rot.out" &
 ROT=$!
 wait_line "$TMP/rot.out" "SYSTEM Welcome, bot1!"
-sed -i 's/^bot1 t0k$/bot1 n3w/' "$TMP/tokens"
+sed 's/^bot1 t0k$/bot1 n3w/' "$TMP/tokens" >"$TMP/tokens.new" && mv "$TMP/tokens.new" "$TMP/tokens"
 kill -HUP "$auth_PID"
 wait $ROT
 expect "rotating a token ends the old session" "$TMP/rot.out" "ERROR 9 Your token is no longer valid"

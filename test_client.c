@@ -36,18 +36,12 @@
  *   HIST 12 #lobby alice hello
  *   ERROR 6 No such room
  */
-#define _GNU_SOURCE
-#include <errno.h>
 #include <getopt.h>
-#include <netdb.h>
-#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <time.h>
-#include <unistd.h>
-#include <uuid/uuid.h>
+
+#include "tundra_platform.h"
 
 #include "tundra_codec.h"
 
@@ -59,7 +53,7 @@ typedef struct {
     const char *target; /* for 'm' */
 } Action;
 
-static int sock = -1;
+static tsock_t sock = TSOCK_INVALID;
 static int auto_ack = 0;
 static int echo_agent = 0;
 static int stream_agent = 0;
@@ -69,9 +63,7 @@ static uint8_t inbuf[TUNDRA_MAX_FRAME];
 static size_t inlen = 0;
 
 static long now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+    return (long)plat_mono_ms();
 }
 
 static TundraBytes str(const char *s) {
@@ -81,9 +73,9 @@ static TundraBytes str(const char *s) {
 
 static int send_all(const uint8_t *buf, size_t len) {
     while (len > 0) {
-        ssize_t n = send(sock, buf, len, MSG_NOSIGNAL);
+        long n = plat_send(sock, buf, len);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (plat_interrupted()) continue;
             return -1;
         }
         buf += n;
@@ -127,9 +119,9 @@ static int handle_frame(const uint8_t *frame, size_t plen) {
 
     switch (type) {
         case MSG_SYSTEM:
-            if (!uuid_is_null(m.u.system.id)) {
+            if (!tundra_uuid_is_null(m.u.system.id)) {
                 char s[37];
-                uuid_unparse_lower(m.u.system.id, s);
+                tundra_uuid_unparse(m.u.system.id, s);
                 printf("SESSION %s\n", s);
             }
             printf("SYSTEM %.*s\n", (int)m.u.system.text.len, (const char *)m.u.system.text.p);
@@ -264,45 +256,21 @@ static int pump(long deadline, int until_type) {
 
         long wait = deadline - now_ms();
         if (wait <= 0) return 0;
-        struct pollfd pfd = { sock, POLLIN, 0 };
-        int pr = poll(&pfd, 1, (int)wait);
-        if (pr < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
+        int pr = plat_wait_readable(sock, (int)wait);
+        if (pr < 0) return -1;
         if (pr == 0) return 0;
-        ssize_t n = recv(sock, inbuf + inlen, sizeof(inbuf) - inlen, 0);
+        long n = plat_recv(sock, inbuf + inlen, sizeof(inbuf) - inlen);
         if (n == 0) {
             printf("CLOSED\n");
             fflush(stdout);
             return -1;
         }
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (plat_interrupted()) continue;
             return -1;
         }
         inlen += (size_t)n;
     }
-}
-
-static int connect_to(const char *host, const char *port) {
-    struct addrinfo hints = {0}, *res, *ai;
-    hints.ai_socktype = SOCK_STREAM;
-    int rc = getaddrinfo(host, port, &hints, &res);
-    if (rc != 0) {
-        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rc));
-        return -1;
-    }
-    int fd = -1;
-    for (ai = res; ai; ai = ai->ai_next) {
-        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) continue;
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
-        close(fd);
-        fd = -1;
-    }
-    freeaddrinfo(res);
-    return fd;
 }
 
 static int run_action(const Action *a) {
@@ -404,7 +372,7 @@ int main(int argc, char **argv) {
     memset(&reg, 0, sizeof(reg));
     reg.type = MSG_REGISTER;
     reg.u.reg.username = str(user);
-    if (resume && uuid_parse(resume, reg.u.reg.id) != 0) {
+    if (resume && tundra_uuid_parse(resume, reg.u.reg.id) != 0) {
         fprintf(stderr, "invalid session id: %s\n", resume);
         return 2;
     }
@@ -423,8 +391,12 @@ int main(int argc, char **argv) {
     reg.u.reg.ext.p = ext;
     reg.u.reg.ext.len = xw.len;
 
-    sock = connect_to(host, port);
-    if (sock < 0) {
+    if (plat_init() != 0) {
+        fprintf(stderr, "cannot start networking\n");
+        return 1;
+    }
+    sock = plat_connect(host, port);
+    if (sock == TSOCK_INVALID) {
         fprintf(stderr, "could not connect to %s:%s\n", host, port);
         return 1;
     }
@@ -436,7 +408,7 @@ int main(int argc, char **argv) {
     int t = pump(now_ms() + 5000, MSG_SYSTEM);
     if (t != MSG_SYSTEM) {
         if (t == 0) fprintf(stderr, "no reply to register\n");
-        close(sock);
+        plat_close(sock);
         return 1;
     }
 
@@ -448,6 +420,6 @@ int main(int argc, char **argv) {
     }
 
     pump(now_ms() + (long)(wait_s * 1000), -1);
-    close(sock);
+    plat_close(sock);
     return 0;
 }

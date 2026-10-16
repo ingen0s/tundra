@@ -101,7 +101,7 @@ After the username, `REGISTER` may carry any number of extensions, each `u8 tag`
 
 Authentication is optional and configured on the server with a tokens file of `username token` lines (`-t`). A username listed there can only register with its token in the `TOKEN` extension; a missing or wrong token gets `UNAUTHORIZED` and the connection is closed. Names not in the file are open unless the server runs with `-A`, which requires every username to be listed. Resuming a session needs only its session id, which is itself a 122-bit secret. Tokens travel in clear text, so use TLS (for now, a TLS-terminating proxy) on untrusted networks.
 
-The file is re-read on `SIGHUP`. Loading fails closed: a file with any malformed line, a duplicate name, a token over 256 characters, or no entries at all is rejected as a whole; at startup the server refuses to start, and on reload the previous tokens stay in force. After a successful reload, sessions whose name no longer accepts the token they registered with are ended (`UNAUTHORIZED`, then disconnected).
+The file is re-read on `SIGHUP` (Linux and macOS; Windows has no SIGHUP, so restart the server there). Loading fails closed: a file with any malformed line, a duplicate name, a token over 256 characters, or no entries at all is rejected as a whole; at startup the server refuses to start, and on reload the previous tokens stay in force. After a successful reload, sessions whose name no longer accepts the token they registered with are ended (`UNAUTHORIZED`, then disconnected).
 
 ## Sessions
 
