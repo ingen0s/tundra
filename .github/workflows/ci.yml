@@ -71,6 +71,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
       - name: TypeScript SDK against a live server
         run: ./tests/ts_sdk.sh
+      - name: Package contents
+        working-directory: sdk/typescript
+        run: |
+          npm pack --dry-run 2>&1 | tee "$RUNNER_TEMP/pack.log"
+          grep -q "dist/index.d.ts" "$RUNNER_TEMP/pack.log"
 
   no-tls:
     # the build without OpenSSL still works and refuses -C/-K clearly

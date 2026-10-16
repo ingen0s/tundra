@@ -4,17 +4,15 @@
 //
 // The server must run with `-w TUNDRA_WS_PORT` for the WebSocket tests.
 // TUNDRA_EXPIRY_PORT, if set, names a second server started with `-g 0`
-// (sessions expire at once) for the session-expiry test. The TLS test runs
-// when openssl is available, through a local TLS proxy in front of TUNDRA_PORT.
+// (sessions expire at once) for the session-expiry tests. TUNDRA_TLS_PORT and
+// TUNDRA_WSS_PORT name a server started with `-C cert -K key -w`, whose CA is
+// in TUNDRA_TLS_CA (and NODE_EXTRA_CA_CERTS, so wss:// trusts it);
+// TUNDRA_TLS_OTHER_CA is an unrelated CA for the untrusted-certificate test.
 // tests/ts_sdk.sh at the repository root builds and starts the servers for you.
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import net from "node:net";
-import tls from "node:tls";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import {
   Agent,
   AgentError,
@@ -32,6 +30,10 @@ const PORT = Number(process.env.TUNDRA_PORT ?? 4242);
 const WS_PORT = Number(process.env.TUNDRA_WS_PORT ?? 0);
 const WS_URL = `ws://${HOST}:${WS_PORT}/ws`;
 const EXPIRY_PORT = Number(process.env.TUNDRA_EXPIRY_PORT ?? 0);
+const TLS_PORT = Number(process.env.TUNDRA_TLS_PORT ?? 0);
+const WSS_PORT = Number(process.env.TUNDRA_WSS_PORT ?? 0);
+const TLS_CA = process.env.TUNDRA_TLS_CA;
+const TLS_OTHER_CA = process.env.TUNDRA_TLS_OTHER_CA;
 // unique names so repeated runs against one server do not collide
 const tag = Math.random().toString(36).slice(2, 7);
 const name = (n) => `ts${n}-${tag}`;
@@ -94,6 +96,14 @@ describe("codec", () => {
     bad[0] = 2;
     assert.throws(() => decodeMessage(bad), /version/);
     assert.throws(() => encodeFrame({ type: MsgType.JOIN, room: "x".repeat(256) }, 0), RangeError);
+  });
+
+  it("rejects an AGENT_LIST truncated flag other than 0 or 1", () => {
+    const f = encodeFrame({ type: MsgType.AGENT_LIST, truncated: false, agents: [] }, 0);
+    f[7] = 2;
+    assert.throws(() => decodeMessage(f), /truncated/);
+    f[7] = 1;
+    assert.equal(decodeMessage(f).message.truncated, true);
   });
 
   it("splits a byte stream into frames", () => {
@@ -255,6 +265,64 @@ describe("TCP client and agent", () => {
     await assert.rejects(c.send("#lobby", "x"), /not connected/);
   });
 
+  it("a failed connect ends messages(), nextMessage() and ready()", async () => {
+    const probe = net.createServer();
+    await new Promise((r) => probe.listen(0, HOST, r));
+    const deadPort = probe.address().port;
+    await new Promise((r) => probe.close(r)); // nothing listens there now
+    const c = new Client({ host: HOST, port: deadPort, username: name("dead") });
+    const it = c.messages();
+    const pendingNext = it.next();
+    const closed = c.next("closed");
+    const connecting = c.connect();
+    const ready = c.ready();
+    await assert.rejects(connecting, /ECONNREFUSED/);
+    await assert.rejects(pendingNext, /ECONNREFUSED/);
+    await assert.rejects(ready, /ECONNREFUSED/);
+    await assert.rejects(c.nextMessage(100), /ECONNREFUSED/);
+    assert.match(String((await closed).error), /ECONNREFUSED/);
+    assert.match(String(c.error), /ECONNREFUSED/);
+    await c.close(); // still fine to call
+  });
+
+  it("close() always ends messages()", async () => {
+    const c = await Client.connect({ host: HOST, port: PORT, username: name("closer") });
+    const it = c.messages();
+    const pendingNext = it.next();
+    await c.close();
+    assert.deepEqual(await pendingNext, { done: true, value: undefined });
+    await c.close();
+    assert.equal(await c.nextMessage(100), null);
+  });
+
+  it("an agent's answer survives a dropped socket while the handler runs", async () => {
+    const slowName = name("slow");
+    const slow = await Agent.connect({
+      host: HOST,
+      port: PORT,
+      username: slowName,
+      reconnectDelayMs: 600, // still reconnecting when the handler finishes
+      handler: async (req) => {
+        await sleep(300);
+        return `done: ${req.body}`;
+      },
+    });
+    const errors = [];
+    slow.on("error", (e) => errors.push(e));
+    try {
+      const answer = alice.request(slowName, "q", { timeoutMs: 5000 });
+      await sleep(100);
+      const resumed = slow.next("connected");
+      slow.transport.close();
+      assert.equal(slow.state, "reconnecting");
+      assert.equal(await answer, "done: q");
+      assert.equal((await resumed).resumed, true);
+      assert.deepEqual(errors, []);
+    } finally {
+      await slow.close();
+    }
+  });
+
   it("refused registration leaves no background reconnect", async () => {
     const dup = new Client({ host: HOST, port: PORT, username: bob.username });
     const retries = [];
@@ -367,6 +435,38 @@ describe("session expiry", { skip: EXPIRY_PORT ? false : "set TUNDRA_EXPIRY_PORT
     await c.close();
   });
 
+  it("drops queued agent answers when the session comes back fresh", async () => {
+    const agentName = name("expagent");
+    const ag = await Agent.connect({
+      host: HOST,
+      port: EXPIRY_PORT,
+      username: agentName,
+      reconnectDelayMs: 1500, // the server releases the session meanwhile
+      handler: async (req) => {
+        await sleep(300);
+        return `late: ${req.body}`;
+      },
+    });
+    const asker = await Client.connect({ host: HOST, port: EXPIRY_PORT, username: name("asker") });
+    const errors = [];
+    ag.on("error", (e) => errors.push(e));
+    try {
+      const answer = asker.request(agentName, "q", { timeoutMs: 5000 });
+      await sleep(100);
+      const back = ag.next("connected");
+      ag.transport.close();
+      // the server closes the request when the session ends
+      await assert.rejects(answer, (e) => e instanceof AgentError && e.status === 4);
+      assert.equal((await back).resumed, false);
+      await sleep(200);
+      assert.deepEqual(errors, [], "the stale answer was not sent to the new session");
+      assert.equal(await asker.request(agentName, "again"), "late: again");
+    } finally {
+      await ag.close();
+      await asker.close();
+    }
+  });
+
   it("registers a fresh session, rejoins rooms and keeps working", async () => {
     const room = `#exp-${tag}`;
     const erin = await Client.connect({ host: HOST, port: EXPIRY_PORT, username: name("erin"), reconnectDelayMs: 1500 });
@@ -394,48 +494,11 @@ describe("session expiry", { skip: EXPIRY_PORT ? false : "set TUNDRA_EXPIRY_PORT
   });
 });
 
-function makeCert() {
-  try {
-    const dir = mkdtempSync(join(tmpdir(), "tundra-tls-"));
-    execFileSync("openssl", [
-      "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=localhost",
-      "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost",
-      "-keyout", join(dir, "key.pem"), "-out", join(dir, "cert.pem"),
-    ], { stdio: "ignore" });
-    const out = { key: readFileSync(join(dir, "key.pem")), cert: readFileSync(join(dir, "cert.pem")) };
-    rmSync(dir, { recursive: true, force: true });
-    return out;
-  } catch {
-    return null;
-  }
-}
+describe("built-in server TLS", { skip: TLS_PORT && TLS_CA ? false : "set TUNDRA_TLS_PORT and TUNDRA_TLS_CA (a server with -C/-K)" }, () => {
+  const ca = TLS_CA ? readFileSync(TLS_CA) : null;
 
-const CERT = makeCert();
-
-describe("TLS transport", { skip: CERT ? false : "openssl not available" }, () => {
-  let proxy;
-  let tlsPort;
-
-  before(async () => {
-    // a TLS-terminating proxy in front of the plain TCP port, as the README suggests
-    proxy = tls.createServer({ key: CERT.key, cert: CERT.cert }, (sock) => {
-      const up = net.connect(PORT, HOST);
-      sock.pipe(up).pipe(sock);
-      const done = () => {
-        sock.destroy();
-        up.destroy();
-      };
-      sock.on("error", done).on("close", done);
-      up.on("error", done).on("close", done);
-    });
-    await new Promise((r) => proxy.listen(0, HOST, r));
-    tlsPort = proxy.address().port;
-  });
-
-  after(() => new Promise((r) => proxy.close(r)));
-
-  it("connects, chats and asks over TLS", async () => {
-    const c = await Client.connect({ host: HOST, port: tlsPort, username: name("tls"), tls: { ca: CERT.cert } });
+  it("TCP over TLS with tls: { ca }", async () => {
+    const c = await Client.connect({ host: HOST, port: TLS_PORT, username: name("tls"), tls: { ca } });
     try {
       assert.equal(c.state, "connected");
       await c.join(`#tls-${tag}`);
@@ -446,9 +509,28 @@ describe("TLS transport", { skip: CERT ? false : "openssl not available" }, () =
     }
   });
 
-  it("refuses an untrusted certificate without retrying", async () => {
-    const c = new Client({ host: HOST, port: tlsPort, username: name("tlsbad"), tls: true });
-    await assert.rejects(c.connect(), /self.signed|certificate/i);
+  it("wss:// to the same server, talking to a TLS TCP client", { skip: WSS_PORT ? false : "set TUNDRA_WSS_PORT" }, async () => {
+    const w = await Client.connect({ url: `wss://localhost:${WSS_PORT}/ws`, username: name("wss") });
+    const t = await Client.connect({ host: "localhost", port: TLS_PORT, username: name("tls2"), tls: { ca } });
+    try {
+      await t.send(w.username, "over tls");
+      const m = await w.nextMessage(2000);
+      assert.equal(m?.text, "over tls");
+      assert.equal(m?.direct, true);
+    } finally {
+      await w.close();
+      await t.close();
+    }
+  });
+
+  it("refuses an untrusted certificate without retrying", { skip: TLS_OTHER_CA ? false : "set TUNDRA_TLS_OTHER_CA" }, async () => {
+    const c = new Client({ host: HOST, port: TLS_PORT, username: name("tlsbad"), tls: { ca: readFileSync(TLS_OTHER_CA) } });
+    const retries = [];
+    c.on("reconnecting", (e) => retries.push(e));
+    await assert.rejects(c.connect(), /certificate|self.signed|verify/i);
     assert.equal(c.state, "closed");
+    await sleep(300);
+    assert.deepEqual(retries, []);
+    assert.equal(c.transport, null);
   });
 });

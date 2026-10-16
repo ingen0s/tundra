@@ -58,11 +58,20 @@ export class Agent extends Client {
   capabilities: unknown;
   private handlerFn: AgentHandler | null;
   private aborter = new AbortController();
+  /** Answers produced while reconnecting, sent once the session resumes. */
+  private unsent: { req: AgentRequest; status: number; final: boolean; body: string }[] = [];
+  /** Most answers held while reconnecting; older ones are dropped beyond this. */
+  static maxUnsent = 4096;
 
   constructor(options: AgentOptions) {
     super(options);
     this.capabilities = options.capabilities ?? {};
     this.handlerFn = options.handler ?? null;
+    // however the client stops (close(), failed connect, giving up), outstanding work is void
+    this.on("closed", () => {
+      this.aborter.abort();
+      this.unsent = [];
+    });
   }
 
   /** Sets the request handler. Returns it, so it can wrap a function definition. */
@@ -85,18 +94,18 @@ export class Agent extends Client {
     if (this.connected) this.sendAdvertise();
   }
 
-  override async close(): Promise<void> {
-    this.aborter.abort();
-    await super.close();
-  }
-
   protected override onConnected(resumed: boolean): void {
     if (!resumed || this.aborter.signal.aborted) {
       // a fresh session cannot answer requests given to an old one; after close() start over
       this.aborter.abort();
       this.aborter = new AbortController();
+      this.unsent = [];
     }
     this.sendAdvertise();
+    // the session resumed: the server still holds those requests open, so deliver the answers
+    const queued = this.unsent;
+    this.unsent = [];
+    for (const r of queued) this.respond(r.req, r.status, r.final, r.body);
   }
 
   private sendAdvertise(): void {
@@ -114,11 +123,19 @@ export class Agent extends Client {
 
   private respond(req: AgentRequest, status: number, final: boolean, body: string): void {
     if (req.signal.aborted) return;
-    try {
-      this.sendMessage({ type: MsgType.AGENT_RESPONSE, requester: req.sender, handle: req.id, status, final, body });
-    } catch {
-      /* the connection dropped; the server answers the requester itself if the session ends */
+    if (this.connected && this.unsent.length === 0) {
+      try {
+        this.sendMessage({ type: MsgType.AGENT_RESPONSE, requester: req.sender, handle: req.id, status, final, body });
+        return;
+      } catch {
+        /* the connection just dropped: hold the answer for the resumed session */
+      }
     }
+    if (this.state === "closed") return;
+    // Reconnecting: keep it until the session resumes. If the session turns out
+    // to be fresh, the server has already answered the requester UNAVAILABLE.
+    this.unsent.push({ req, status, final, body });
+    if (this.unsent.length > Agent.maxUnsent) this.unsent.shift();
   }
 
   private async handle(req: AgentRequest): Promise<void> {

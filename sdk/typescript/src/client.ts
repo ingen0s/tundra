@@ -76,8 +76,11 @@ export interface ClientEvents {
   disconnected: { error?: Error };
   /** About to try reconnecting after `delayMs`. */
   reconnecting: { attempt: number; delayMs: number };
-  /** The client stopped: close() was called, or it gave up (`error` is set). */
-  closed: { error?: TundraError };
+  /**
+   * The client stopped: close() was called, connect() failed, or it gave up
+   * reconnecting. `error` is set unless close() was called.
+   */
+  closed: { error?: Error };
   /** Every chat message, after de-duplication (also delivered by messages()). */
   chat: Chat;
   roomEvent: RoomEvent;
@@ -201,8 +204,11 @@ export class Client extends Emitter<ClientEvents> {
   lastId = 0n;
   /** True when the last agents() call got a truncated list. */
   agentsTruncated = false;
-  /** Set when the client gives up (name taken, invalid name, unauthorized). */
-  error: TundraError | null = null;
+  /**
+   * Why the client stopped: the error connect() failed with, or the TundraError
+   * that made it give up reconnecting (name taken, invalid name, unauthorized).
+   */
+  error: Error | null = null;
   /** Rooms this session is in, kept up to date from room events. */
   readonly joinedRooms = new Set<string>();
 
@@ -288,19 +294,22 @@ export class Client extends Emitter<ClientEvents> {
         await this.open();
       }
     } catch (err) {
-      this.closing = true;
-      this._state = "closed";
-      this.dropTransport();
+      // nothing will arrive: end messages(), nextMessage() and ready() with the reason
+      const error = err instanceof Error ? err : new ConnectionError(String(err));
+      this.error = error;
+      this.shutdown();
+      this.inbox.end(error);
+      this.emit("closed", { error });
       throw err;
     }
   }
 
   /** Closes the connection and stops reconnecting. messages() ends. */
   async close(): Promise<void> {
-    if (this._state === "closed" && this.closing) return;
-    this.shutdown();
-    this.inbox.end();
-    this.emit("closed", {});
+    const already = this._state === "closed" && this.closing;
+    if (!already) this.shutdown();
+    this.inbox.end(); // no-op if it already ended with an error
+    if (!already) this.emit("closed", {});
   }
 
   /** Resolves once the client is connected (immediately if it is). */
@@ -498,11 +507,17 @@ export class Client extends Emitter<ClientEvents> {
     });
   }
 
+  /**
+   * Sends a message and registers a pending reply. `cancel()` forgets this
+   * call (only this one: a later call may reuse the sequence number after it
+   * wraps) and is safe to run more than once.
+   */
   private callRaw(
     m: ClientMessage,
     expect: readonly ServerType[],
     opts: CallOptions = {},
-  ): { promise: Promise<ServerMessage>; seq: number } {
+  ): { promise: Promise<ServerMessage>; cancel: () => void } {
+    let pending: PendingCall | null = null;
     let seq = -1;
     const promise = new Promise<ServerMessage>((resolve, reject) => {
       seq = this.sendMessage(m, opts.beforeRegister);
@@ -513,16 +528,23 @@ export class Client extends Emitter<ClientEvents> {
           if (this.replies.get(seq) === p) this.replies.delete(seq);
           reject(new RequestTimeoutError(`no reply to ${MsgType[m.type]} within ${timeout} ms`));
         }, timeout);
+      // a call still waiting after 65536 frames loses its slot: its reply can no longer be told apart
+      const displaced = this.replies.get(seq);
+      if (displaced) {
+        if (displaced.timer !== undefined) clearTimeout(displaced.timer);
+        displaced.reject(new ConnectionError("sequence number reused before a reply arrived"));
+      }
       this.replies.set(seq, p);
+      pending = p;
     });
-    return { promise, seq };
-  }
-
-  private cancelCall(seq: number): void {
-    const p = this.replies.get(seq);
-    if (!p) return;
-    this.replies.delete(seq);
-    if (p.timer !== undefined) clearTimeout(p.timer);
+    let cancelled = false;
+    const cancel = (): void => {
+      if (cancelled || pending === null) return;
+      cancelled = true;
+      if (this.replies.get(seq) === pending) this.replies.delete(seq);
+      if (pending.timer !== undefined) clearTimeout(pending.timer);
+    };
+    return { promise, cancel };
   }
 
   private onFrame(gen: number, bytes: Uint8Array): void {
@@ -636,12 +658,12 @@ export class Client extends Emitter<ClientEvents> {
 
   private waitRoomEvent(room: string, event: RoomEventKind, m: ClientMessage): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const { promise, seq } = this.callRaw(m, [MsgType.ERROR]);
+      const { promise, cancel } = this.callRaw(m, [MsgType.ERROR]);
       const waiter: RoomWaiter = {
         room,
         event,
         resolve: () => {
-          this.cancelCall(seq);
+          cancel();
           resolve();
         },
       };
@@ -763,11 +785,11 @@ export class Client extends Emitter<ClientEvents> {
     const rid = this.nextReq++;
     const q = new AsyncQueue<AgentAnswer>();
     this.requests.set(rid, q);
-    let seq = -1;
+    let cancel = (): void => {};
     try {
       // A refused request comes back as an ERROR reply to the request's sequence number.
       const c = this.callRaw({ type: MsgType.AGENT_REQUEST, agent, reqId: rid, body }, [MsgType.ERROR], { timeoutMs: null });
-      seq = c.seq;
+      cancel = c.cancel;
       c.promise.then(
         (reply) => q.end(errorOf(reply) ?? new ConnectionError("unexpected reply")),
         () => {
@@ -777,7 +799,7 @@ export class Client extends Emitter<ClientEvents> {
       for (;;) {
         const r = await q.take(timeoutMs);
         if (r.done) throw new RequestTimeoutError(`no answer from ${agent} within ${timeoutMs} ms`);
-        this.cancelCall(seq); // the request was accepted
+        cancel(); // the request was accepted
         const a = r.value;
         if (a.status !== 0) throw new AgentError(agent, a.status, a.body);
         yield a.body;
@@ -785,7 +807,7 @@ export class Client extends Emitter<ClientEvents> {
       }
     } finally {
       this.requests.delete(rid);
-      if (seq >= 0) this.cancelCall(seq);
+      cancel();
     }
   }
 

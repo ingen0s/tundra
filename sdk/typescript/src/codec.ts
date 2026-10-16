@@ -559,7 +559,9 @@ export function decodePayload(type: number, payload: Uint8Array): Message {
       break;
     }
     case MsgType.AGENT_LIST: {
-      const truncated = r.bool();
+      const flag = r.u8();
+      if (flag > 1) throw new DecodeError("AGENT_LIST truncated flag must be 0 or 1");
+      const truncated = flag === 1;
       const agents: AgentEntry[] = [];
       for (let n = r.u16(); n > 0; n--) agents.push({ name: r.str8(), online: r.bool(), capabilities: r.str16() });
       m = { type, truncated, agents };
