@@ -46,7 +46,7 @@ typedef struct Session {
     char username[TUNDRA_MAX_USERNAME + 1];
     struct Client *client;      /* set only while ACTIVE */
     time_t connected_at;
-    time_t detached_at;
+    uint64_t detached_at_ms;    /* monotonic; ms so eviction order has no ties */
     uint16_t out_seq;           /* sequence counter for server-initiated frames */
     /* Frames waiting for this session, oldest first. Filled while the
      * session is detached, and while an earlier backlog is still being
@@ -115,6 +115,12 @@ static void log_debug(const char *fmt, ...) {
 static uint64_t wall_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static uint64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
@@ -363,7 +369,7 @@ static Session *alloc_session(void) {
             memset(s, 0, sizeof(*s));
             return s;
         }
-        if (s->state == SESSION_DETACHED && (!oldest || s->detached_at < oldest->detached_at)) oldest = s;
+        if (s->state == SESSION_DETACHED && (!oldest || s->detached_at_ms < oldest->detached_at_ms)) oldest = s;
     }
     if (!oldest) return NULL;
     release_session(oldest, 1);
@@ -382,7 +388,7 @@ static void detach(Client *c) {
     Session *s = c->session;
     if (!s) return;
     s->state = SESSION_DETACHED;
-    s->detached_at = mono_s();
+    s->detached_at_ms = mono_ms();
     s->client = NULL;
     c->session = NULL;
 }
@@ -733,7 +739,7 @@ static void expire_idle(void) {
     }
     for (int i = 0; i < MAX_SESSIONS; i++) {
         Session *s = &sessions[i];
-        if (s->state == SESSION_DETACHED && now - s->detached_at > resume_grace) release_session(s, 1);
+        if (s->state == SESSION_DETACHED && mono_ms() - s->detached_at_ms > (uint64_t)resume_grace * 1000u) release_session(s, 1);
     }
 }
 
