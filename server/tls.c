@@ -44,6 +44,9 @@ int tls_init(const char *cert, const char *key) {
         return -1;
     }
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+#ifdef SSL_OP_NO_RENEGOTIATION
+    SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION); /* the default in OpenSSL 3; explicit for 1.1.1 */
+#endif
     /* the output queue moves as it drains, and partial writes are fine */
     SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
     if (SSL_CTX_use_certificate_chain_file(ctx, cert) != 1) {

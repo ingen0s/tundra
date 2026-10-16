@@ -6,7 +6,7 @@ SANITIZE := -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-r
 # TLS: on when OpenSSL is found (pkg-config), off with TLS=0.
 TLS ?= auto
 ifeq ($(TLS),auto)
-  TLS := $(shell pkg-config --exists openssl 2>/dev/null && echo 1 || echo 0)
+  override TLS := $(shell pkg-config --exists openssl 2>/dev/null && echo 1 || echo 0)
 endif
 ifeq ($(TLS),1)
   TLS_CFLAGS := -DTUNDRA_TLS $(shell pkg-config --cflags openssl 2>/dev/null)

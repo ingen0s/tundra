@@ -4,7 +4,7 @@ A small, fast chat server in C with a compact binary protocol. Rooms, direct mes
 
 ## Status
 
-Early but tested. The server is single-threaded and event-driven (epoll on Linux, kqueue on macOS, WSAPoll on Windows), handles up to 1,000 connections, and runs natively on all three. Every change runs through unit tests, end-to-end tests, AddressSanitizer/UBSan, a fuzzer, and build-and-test jobs on Linux, macOS and Windows in CI. TLS is built in (OpenSSL) for both the Tundra port and the web port.
+Early but tested. The server is single-threaded and event-driven (epoll on Linux, kqueue on macOS, WSAPoll on Windows), handles up to 1,000 connections, and runs natively on all three. Every change runs through unit tests, end-to-end tests, AddressSanitizer/UBSan, a fuzzer, and build-and-test jobs on Linux, macOS and Windows in CI. Optional built-in TLS (OpenSSL, when found at build time) covers both the Tundra port and the web port.
 
 ## Features
 

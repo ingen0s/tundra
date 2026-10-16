@@ -31,12 +31,14 @@ static void usage(const char *prog) {
             "usage: %s [-p port] [-w http-port] [-C cert.pem -K key.pem] [-d database] [-t tokens-file [-A]] [-i idle-timeout-s] [-g resume-grace-s]\n"
             "          [-T agent-timeout-s] [-v]\n"
             "  -w  also serve the web client and WebSockets (GET /ws) on this port\n"
-            "  -C  TLS certificate chain (PEM); with -K, both ports use TLS (wss/https on -w)\n"
-            "  -K  TLS private key (PEM)\n"
+            "%s"
             "  -d  keep messages in this SQLite database (history survives restarts)\n"
             "  -t  \"username token\" file: listed names must present their token (re-read on SIGHUP)\n"
             "  -A  with -t, every username must be listed\n",
-            prog);
+            prog,
+            tls_available() ? "  -C  TLS certificate chain (PEM); with -K, both ports use TLS (wss/https on -w)\n"
+                              "  -K  TLS private key (PEM)\n"
+                            : "  -C, -K  TLS certificate and key (not in this build: rebuild with OpenSSL)\n");
 }
 
 int main(int argc, char **argv) {

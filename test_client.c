@@ -82,6 +82,14 @@ static TundraBytes str(const char *s) {
     return b;
 }
 
+static int io_tls(void) {
+#ifdef TUNDRA_TLS
+    return tls != NULL;
+#else
+    return 0;
+#endif
+}
+
 static long io_send(const void *buf, size_t len) {
 #ifdef TUNDRA_TLS
     if (tls) {
@@ -115,7 +123,7 @@ static int send_all(const uint8_t *buf, size_t len) {
     while (len > 0) {
         long n = io_send(buf, len);
         if (n < 0) {
-            if (plat_interrupted()) continue;
+            if (!io_tls() && plat_interrupted()) continue;
             return -1;
         }
         buf += n;
@@ -359,7 +367,11 @@ static int run_action(const Action *a) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "usage: %s -u username [-H host] [-p port] [-s [-x]] [-k token] [-r session-id [-f last-id]] [-a]\n"
+            "usage: %s -u username [-H host] [-p port]"
+#ifdef TUNDRA_TLS
+            " [-s [-x]]"
+#endif
+            " [-k token] [-r session-id [-f last-id]] [-a]\n"
             "          [-j #room] [-L #room] [-t target] [-m text] [-R] [-W #room] [-y #room] [-c]\n"
             "          [-G capabilities] [-q agent:body] [-Q] [-E [-S]]\n"
             "          [-w seconds]\n",
@@ -445,6 +457,10 @@ int main(int argc, char **argv) {
     if (use_tls) {
 #ifdef TUNDRA_TLS
         tls_ctx = SSL_CTX_new(TLS_client_method());
+        if (!tls_ctx) {
+            fprintf(stderr, "cannot create a TLS context\n");
+            return 1;
+        }
         SSL_CTX_set_min_proto_version(tls_ctx, TLS1_2_VERSION);
         if (insecure) {
             SSL_CTX_set_verify(tls_ctx, SSL_VERIFY_NONE, NULL);
@@ -453,7 +469,10 @@ int main(int argc, char **argv) {
             SSL_CTX_set_verify(tls_ctx, SSL_VERIFY_PEER, NULL);
         }
         tls = SSL_new(tls_ctx);
-        SSL_set_fd(tls, (int)sock);
+        if (!tls || SSL_set_fd(tls, (int)sock) != 1) {
+            fprintf(stderr, "cannot set up TLS on the connection\n");
+            return 1;
+        }
         SSL_set_tlsext_host_name(tls, host);
         if (!insecure) SSL_set1_host(tls, host);
         if (SSL_connect(tls) != 1) {

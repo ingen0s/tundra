@@ -1023,7 +1023,7 @@ cat "$TMP/sdk.out"
 stop_server ws
 
 # 26. built-in TLS
-if "$SERVER" -h 2>&1 | grep -q -- "-C  TLS" && command -v openssl >/dev/null && "$CLIENT" -h 2>&1 | grep -q -- "-s"; then
+if "$SERVER" -h 2>&1 | grep -q -- "-C  TLS" && command -v openssl >/dev/null && "$CLIENT" -h 2>&1 | grep -q -- "-s \[-x\]"; then
     # a throwaway CA and a localhost certificate signed by it
     (
         cd "$TMP" &&
@@ -1051,6 +1051,7 @@ if "$SERVER" -h 2>&1 | grep -q -- "-C  TLS" && command -v openssl >/dev/null && 
     expect "an untrusted certificate fails verification" "$TMP/tlsverify.out" "certificate verify failed"
     client -u tlsplain -w 0.3 >"$TMP/tlsplain.out" 2>&1
     expect_not "plaintext clients cannot register on a TLS port" "$TMP/tlsplain.out" "SYSTEM Welcome"
+    expect "the server rejects the plaintext handshake" "$TMP/tls.log" "wrong version number"
 
     raw >"$TMP/tlsraw.out" <<PY
 import sys, struct, ssl, asyncio, urllib.request, time

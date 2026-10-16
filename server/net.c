@@ -283,7 +283,13 @@ static void read_client(Client *c) {
             process_input(c);
             continue;
         }
-        if (n != -1) mark_dead(c); /* closed or failed */
+        if (n != -1) {
+            mark_dead(c); /* closed or failed */
+            return;
+        }
+        /* TLS may need the socket writable to make progress on a read
+         * (handshake or post-handshake messages) even with nothing queued */
+        if (c->ssl) set_want_write(c, c->out_len > 0);
         return;
     }
 }
@@ -306,7 +312,7 @@ static void accept_clients(tsock_t listener, int proto) {
         Client *c = alloc_client(s);
         if (!c) {
             log_info("no free client slots, rejecting a connection");
-            if (proto == PROTO_TCP) reject_full(s);
+            if (proto == PROTO_TCP && !tls_enabled()) reject_full(s); /* a plaintext error means nothing to a TLS client */
             else plat_close(s);
             continue;
         }
@@ -373,10 +379,12 @@ static int drain_tls_pending(void) {
     int more = 0;
     for (int i = 0; i < MAX_CLIENTS; i++) {
         Client *c = &clients[i];
-        if (c->fd < 0 || c->dead || !tls_pending(c)) continue;
+        if (c->fd < 0 || c->dead || c->close_after_flush || !tls_pending(c)) continue;
         read_client(c);
         if (!c->dead && c->out_len > 0) flush_client(c);
-        if (!c->dead && tls_pending(c)) more = 1;
+        /* a client closing after its flush reads no more, so its leftover
+         * input must not keep the loop spinning */
+        if (!c->dead && !c->close_after_flush && tls_pending(c)) more = 1;
     }
     return more;
 }
