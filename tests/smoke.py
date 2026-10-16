@@ -45,10 +45,14 @@ def free_port():
 
 
 def start(port, wsport, db):
-    kwargs = {"stderr": subprocess.PIPE}
+    # log to a file: a pipe nobody reads fills up (about 4 KB on Windows)
+    # and would block the server
+    log = open(db + ".log", "w+b")
+    kwargs = {"stderr": log}
     if WINDOWS:
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     proc = subprocess.Popen([SERVER, "-p", str(port), "-w", str(wsport), "-d", db], **kwargs)
+    proc.log = log
     for _ in range(100):
         try:
             socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
@@ -68,7 +72,9 @@ def stop(proc):
     except subprocess.TimeoutExpired:
         proc.kill()
         code = None
-    err = proc.stderr.read().decode(errors="replace")
+    proc.log.seek(0)
+    err = proc.log.read().decode(errors="replace")
+    proc.log.close()
     return code, err
 
 
