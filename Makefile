@@ -12,6 +12,7 @@ CODEC_T := $(BUILD)/codec_test
 FUZZER  := $(BUILD)/fuzz_codec
 HEADERS := tundra_protocol.h tundra_codec.h
 CODEC   := tundra_codec.c
+SERVER_SRC := $(wildcard server/*.c)
 
 FUZZ_TIME ?= 60
 FUZZ_CC   ?= $(shell command -v clang-18 || echo clang)
@@ -23,8 +24,8 @@ all: $(SERVER) $(CLIENT) $(CODEC_T)
 $(BUILD):
 	mkdir -p $(BUILD)
 
-$(SERVER): tundra_chat_server.c $(CODEC) $(HEADERS) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tundra_chat_server.c $(CODEC) $(LDLIBS)
+$(SERVER): $(SERVER_SRC) server/server.h $(CODEC) $(HEADERS) | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(SERVER_SRC) $(CODEC) $(LDLIBS)
 
 $(CLIENT): test_client.c $(CODEC) $(HEADERS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ test_client.c $(CODEC) $(LDLIBS)

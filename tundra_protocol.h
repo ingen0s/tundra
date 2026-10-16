@@ -5,7 +5,7 @@
  * All multi-byte integers are big-endian (network order).
  *
  *   offset 0  version   u8   always 0x01
- *   offset 1  flags     u8   reserved, must be 0
+ *   offset 1  flags     u8   reserved: send 0, ignored by the server
  *   offset 2  seq       u16  sequence number
  *   offset 4  length    u16  number of payload bytes AFTER the 7-byte header
  *   offset 6  type      u8   message type
@@ -27,27 +27,59 @@
 #define TUNDRA_MAX_USERNAME 32
 #define TUNDRA_UUID_LEN     16
 
-/* Longest chat text that still fits in a broadcast frame:
- * broadcast payload = ulen(1) + username + timestamp(8) + mlen(2) + text */
-#define TUNDRA_MAX_TEXT (TUNDRA_MAX_PAYLOAD - 11 - TUNDRA_MAX_USERNAME)
+#define TUNDRA_MAX_ROOM     32  /* including the leading '#' */
+#define TUNDRA_MAX_HISTORY  100 /* entries per HISTORY request */
 
+/* Longest chat text that still fits in any frame that carries it. The
+ * tightest is HISTORY_RESULT holding one entry: room(1+32) count(2), then
+ * len(2) and a CHAT payload of id(8) ts(8) kind(1) target(1+32)
+ * sender(1+32) mlen(2) text. */
+#define TUNDRA_MAX_TEXT (TUNDRA_MAX_PAYLOAD - 35 - 2 - 85)
+
+/* Type ranges: 0x01-0x0F and 0x20-0x2F are client -> server,
+ * 0x10-0x1F and 0x30-0x3F are server -> client. */
 enum TundraMessageType {
     /* client -> server */
     MSG_REGISTER          = 0x01, /* id(16) ulen(1) username(ulen)                    */
-    MSG_MESSAGE           = 0x02, /* mlen(2) text(mlen)                               */
-    MSG_AGENT_COMMAND     = 0x03, /* alen(1) agent(alen) clen(2) command(clen)        */
-    MSG_PONG              = 0x04, /* echo of the PING payload (optional)              */
+    MSG_MESSAGE           = 0x02, /* mlen(2) text: shorthand for SEND to #lobby       */
+    MSG_AGENT_COMMAND     = 0x03, /* alen(1) agent clen(2) command                    */
+    MSG_PONG              = 0x04, /* echo of the PING payload; keeps the connection alive */
     MSG_HEALTH_CHECK      = 0x05, /* empty                                            */
+    MSG_JOIN              = 0x06, /* rlen(1) room                                     */
+    MSG_LEAVE             = 0x07, /* rlen(1) room                                     */
+    MSG_SEND              = 0x08, /* kind(1) tlen(1) target mlen(2) text              */
+    MSG_LIST_ROOMS        = 0x09, /* empty                                            */
+    MSG_HISTORY           = 0x0B, /* rlen(1) room before_id(8) limit(2)               */
+    MSG_WHO               = 0x0C, /* rlen(1) room                                     */
 
     /* server -> client */
     MSG_SYSTEM            = 0x10, /* id(16) mlen(2) text(mlen); id is nil for notices */
-    MSG_BROADCAST_MESSAGE = 0x11, /* ulen(1) username ts_ms(8) mlen(2) text           */
-    MSG_BROADCAST_AGENT   = 0x12, /* same layout as BROADCAST_MESSAGE, text = "agent command" */
+    MSG_BROADCAST_MESSAGE = 0x11, /* legacy, no longer sent                          */
+    MSG_BROADCAST_AGENT   = 0x12, /* ulen(1) username ts_ms(8) mlen(2) text           */
     MSG_IMAGE             = 0x13, /* reserved, not implemented                        */
     MSG_PING              = 0x14, /* ts_ms(8)                                         */
     MSG_ERROR             = 0x15, /* code(2) mlen(2) text(mlen)                       */
-    MSG_HEALTH_RESULT     = 0x16  /* ts_ms(8) status(1) latency_ms(4) uptime_ms(4)
+    MSG_HEALTH_RESULT     = 0x16, /* ts_ms(8) status(1) latency_ms(4) uptime_ms(4)
                                      sent(4) received(4)                              */
+    MSG_CHAT              = 0x17, /* id(8) ts_ms(8) kind(1) tlen(1) target
+                                     slen(1) sender mlen(2) text                      */
+    MSG_SENT              = 0x18, /* id(8): reply to SEND/MESSAGE                     */
+    MSG_ROOM_LIST         = 0x19, /* count(2) then count x [rlen(1) room members(2)]  */
+    MSG_ROOM_EVENT        = 0x1A, /* event(1) rlen(1) room ulen(1) user               */
+    MSG_HISTORY_RESULT    = 0x1B, /* rlen(1) room count(2) then count x
+                                     [len(2) CHAT payload], oldest first              */
+    MSG_WHO_RESULT        = 0x1C  /* rlen(1) room count(2) then count x
+                                     [ulen(1) user online(1)]                         */
+};
+
+enum TundraChatKind {
+    CHAT_ROOM   = 0, /* target is a room name */
+    CHAT_DIRECT = 1  /* target is the recipient's username */
+};
+
+enum TundraRoomEvent {
+    ROOM_JOINED = 1,
+    ROOM_LEFT   = 2
 };
 
 enum TundraErrorCode {
@@ -55,7 +87,10 @@ enum TundraErrorCode {
     ERR_INVALID_FORMAT  = 0x0002,
     ERR_SESSION_EXPIRED = 0x0003,
     ERR_SERVER_ERROR    = 0x0004,
-    ERR_NOT_REGISTERED  = 0x0005
+    ERR_NOT_REGISTERED  = 0x0005,
+    ERR_NO_SUCH_TARGET  = 0x0006, /* unknown user or room */
+    ERR_NOT_A_MEMBER    = 0x0007, /* room action that needs membership */
+    ERR_INVALID_NAME    = 0x0008  /* bad room or user name */
 };
 
 /* ---- big-endian helpers ---- */

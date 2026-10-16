@@ -1,0 +1,167 @@
+/* Shared state and interfaces for the Tundra server modules. */
+#ifndef TUNDRA_SERVER_H
+#define TUNDRA_SERVER_H
+
+#include <stdint.h>
+#include <time.h>
+#include <uuid/uuid.h>
+
+#include "../tundra_codec.h"
+
+#define DEFAULT_PORT          4242
+#define MAX_CLIENTS           1000
+#define MAX_SESSIONS          MAX_CLIENTS
+#define MAX_ROOMS             256
+#define LOBBY                 "#lobby"
+#define DEFAULT_IDLE_TIMEOUT  120       /* seconds without any frame before a connection is dropped */
+#define DEFAULT_RESUME_GRACE  120       /* seconds a disconnected session is held for reconnect */
+#define REGISTER_TIMEOUT      10        /* seconds a new connection has to send REGISTER */
+#define PING_INTERVAL         30        /* seconds */
+#define MAX_BUFFERED_MESSAGES 50        /* per session backlog; oldest dropped first */
+#define MAX_BACKLOG_BYTES     (1u << 20)   /* per session backlog */
+#define MAX_TOTAL_BACKLOG     (64u << 20)  /* all backlogs together */
+#define MAX_OUTBOUND_BYTES    (1u << 20)   /* per client; slower clients are disconnected */
+#define REPLAY_HIGH_WATER     (256u << 10) /* backlog replay pauses while this much is queued */
+#define MAX_READS_PER_EVENT   16           /* fairness: other clients get a turn */
+#define MSGLOG_CAPACITY       10000     /* recent messages kept in memory for history */
+#define MSGLOG_MAX_BYTES      (64u << 20) /* and at most this much message text */
+
+typedef enum { SESSION_FREE = 0, SESSION_ACTIVE, SESSION_DETACHED } SessionState;
+
+typedef struct {
+    uint8_t type;
+    uint8_t *payload;
+    size_t len;
+} BufferedFrame;
+
+struct Client;
+
+typedef struct Session {
+    SessionState state;
+    uuid_t id;
+    char username[TUNDRA_MAX_USERNAME + 1];
+    struct Client *client;      /* set only while ACTIVE */
+    time_t connected_at;
+    uint64_t detached_at_ms;    /* monotonic; ms so eviction order has no ties */
+    uint16_t out_seq;           /* sequence counter for server-initiated frames */
+    /* Frames waiting for this session, oldest first. Filled while the
+     * session is detached, and while an earlier backlog is still being
+     * replayed (so live frames never overtake buffered ones). */
+    BufferedFrame backlog[MAX_BUFFERED_MESSAGES];
+    size_t backlog_head;        /* index of oldest entry */
+    size_t backlog_count;
+    size_t backlog_bytes;
+    uint32_t backlog_dropped;   /* frames dropped since the last resume */
+    int pumping;                /* backlog_pump is on the stack */
+    uint32_t latency_ms;
+    uint32_t messages_sent;
+    uint32_t messages_received;
+} Session;
+
+typedef struct Client {
+    int fd;                     /* -1 when the slot is free */
+    int dead;                   /* closed at the end of the current loop iteration */
+    int close_after_flush;
+    int want_write;             /* EPOLLOUT currently registered */
+    Session *session;
+    time_t accepted_at;
+    time_t last_seen;
+    uint8_t *out;
+    size_t out_len;
+    size_t out_cap;
+    size_t in_len;
+    uint8_t in[TUNDRA_MAX_FRAME]; /* keep last: reset code clears everything before it */
+} Client;
+
+typedef struct {
+    int used;
+    char name[TUNDRA_MAX_ROOM + 1];
+    uint64_t first_msg_id;      /* messages before this belong to an earlier room of the same name */
+    uint8_t members[(MAX_SESSIONS + 7) / 8]; /* bit per session index */
+    int member_count;
+} Room;
+
+extern Client clients[MAX_CLIENTS];
+extern Session sessions[MAX_SESSIONS];
+extern int verbose;
+extern int idle_timeout;
+extern int resume_grace;
+
+/* ---- util.c ---- */
+void log_info(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void log_debug(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+uint64_t wall_ms(void);
+uint64_t mono_ms(void);
+time_t mono_s(void);
+int valid_username(const uint8_t *name, size_t len);
+int valid_room_name(const uint8_t *name, size_t len);
+
+/* ---- net.c ---- */
+int net_listen(int port);
+void net_run(void (*tick)(void));          /* event loop; returns on shutdown */
+void net_shutdown(void);
+void mark_dead(Client *c);
+void close_after_flush(Client *c);
+/* Reply to a request: echoes the request's sequence number. */
+void send_frame(Client *c, uint8_t type, uint16_t seq, const uint8_t *payload, size_t len);
+/* Server-initiated frame: uses the session's own sequence counter. */
+void push_frame(Client *c, uint8_t type, const uint8_t *payload, size_t len);
+/* Encodes `msg` and sends it as a reply (seq) or push (when push != 0). */
+void send_msg(Client *c, const TundraMsg *msg, uint16_t seq, int push);
+void send_error(Client *c, uint16_t seq, uint16_t code, const char *text);
+size_t build_error(uint8_t *buf, size_t cap, uint16_t code, const char *text);
+void send_system(Client *c, uint16_t seq, const uuid_t id, const char *text);
+
+/* ---- session.c ---- */
+int session_index(const Session *s);
+Session *find_session_by_id(const uuid_t id);
+Session *find_session_by_name(const char *name);
+Session *find_session_by_bytes(TundraBytes name);
+Session *alloc_session(void); /* may release the longest-detached session */
+void release_session(Session *s);
+void attach(Session *s, Client *c);
+void detach(Client *c);
+/* Delivers a frame to a session: sent now if online, buffered if detached. */
+void deliver(Session *s, uint8_t type, const uint8_t *payload, size_t len);
+/* Sends buffered frames while the connection has room; the rest follow
+ * from flush_client as the socket drains. */
+void backlog_pump(Session *s);
+void backlog_clear(Session *s);
+void sessions_expire(void);
+void sessions_ping(void);
+
+/* ---- rooms.c ---- */
+Room *room_find(TundraBytes name);
+Room *room_find_cstr(const char *name);
+Room *room_get_or_create(TundraBytes name);
+int room_is_member(const Room *r, const Session *s);
+void room_add(Room *r, Session *s);
+void room_remove(Room *r, Session *s);   /* deletes the room when it empties (except the lobby) */
+void rooms_remove_session(Session *s);   /* on expiry: leaves every room, with events */
+/* Delivers a payload to every member except `skip` (may be NULL). */
+void room_deliver(Room *r, const Session *skip, uint8_t type, const uint8_t *payload, size_t len);
+void room_event(Room *r, uint8_t event, const Session *who); /* to members and `who` */
+Room *rooms_iter(int *cursor);
+
+/* ---- msglog.c ---- */
+typedef struct {
+    uint64_t id;
+    uint64_t ts_ms;
+    uint8_t kind;
+    char target[TUNDRA_MAX_USERNAME > TUNDRA_MAX_ROOM ? TUNDRA_MAX_USERNAME + 1 : TUNDRA_MAX_ROOM + 1];
+    char sender[TUNDRA_MAX_USERNAME + 1];
+    uint8_t *text;
+    size_t text_len;
+} LoggedMessage;
+
+/* Appends a message and returns its stored copy (with id assigned), or NULL. */
+const LoggedMessage *msglog_append(uint8_t kind, TundraBytes target, const char *sender, TundraBytes text);
+const LoggedMessage *msglog_get(uint64_t id);   /* NULL if never assigned or evicted */
+uint64_t msglog_last_id(void);
+void msglog_to_chat(const LoggedMessage *m, TundraMsg *out);
+void msglog_free(void);
+
+/* ---- handlers.c ---- */
+void handle_frame(Client *c, const uint8_t *frame, size_t payload_len);
+
+#endif /* TUNDRA_SERVER_H */

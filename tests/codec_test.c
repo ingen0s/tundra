@@ -147,6 +147,60 @@ int main(void) {
         CHECK(tundra_encode(&in, buf, sizeof(buf)) == -1, "unknown type refused by encoder");
     }
 
+    /* CHAT round trip */
+    TundraMsg chat;
+    memset(&chat, 0, sizeof(chat));
+    chat.type = MSG_CHAT;
+    chat.u.chat.id = 99;
+    chat.u.chat.ts_ms = 5;
+    chat.u.chat.kind = CHAT_DIRECT;
+    chat.u.chat.target = str("bob");
+    chat.u.chat.sender = str("alice");
+    chat.u.chat.text = str("psst");
+    n = tundra_encode(&chat, buf, sizeof(buf));
+    CHECK(n == 8 + 8 + 1 + 4 + 6 + 6, "chat encodes to expected size");
+    CHECK(tundra_decode(MSG_CHAT, buf, (size_t)n, &out) == TUNDRA_DECODE_OK && out.u.chat.id == 99 &&
+          out.u.chat.kind == CHAT_DIRECT && bytes_eq(out.u.chat.target, "bob") && bytes_eq(out.u.chat.text, "psst"),
+          "chat fields survive");
+
+    /* HISTORY_RESULT built with the entry writer, read with the iterator */
+    static uint8_t entries[1024];
+    TundraWriter ew = tundra_writer(entries, sizeof(entries));
+    tundra_wr_history_entry(&ew, &chat);
+    chat.u.chat.id = 100;
+    tundra_wr_history_entry(&ew, &chat);
+    memset(&in, 0, sizeof(in));
+    in.type = MSG_HISTORY_RESULT;
+    in.u.list.room = str("#dev");
+    in.u.list.count = 2;
+    in.u.list.entries.p = entries;
+    in.u.list.entries.len = ew.len;
+    n = tundra_encode(&in, buf, sizeof(buf));
+    CHECK(n > 0 && tundra_decode(MSG_HISTORY_RESULT, buf, (size_t)n, &out) == TUNDRA_DECODE_OK, "history result decodes");
+    TundraReader it = tundra_reader(out.u.list.entries.p, out.u.list.entries.len);
+    TundraMsg e1, e2, e3;
+    int got1 = tundra_next_history(&it, &e1), got2 = tundra_next_history(&it, &e2), got3 = tundra_next_history(&it, &e3);
+    CHECK(got1 && got2 && !got3 && e1.u.chat.id == 99 && e2.u.chat.id == 100, "history iterator yields both entries");
+
+    /* a list whose count claims more entries than present is rejected */
+    CHECK(n > 0 && (buf[6] = 3, tundra_decode(MSG_HISTORY_RESULT, buf, (size_t)n, &out)) == TUNDRA_DECODE_MALFORMED,
+          "list count larger than entries rejected");
+
+    /* ROOM_LIST */
+    ew = tundra_writer(entries, sizeof(entries));
+    tundra_wr_room_entry(&ew, str("#lobby"), 3);
+    memset(&in, 0, sizeof(in));
+    in.type = MSG_ROOM_LIST;
+    in.u.list.count = 1;
+    in.u.list.entries.p = entries;
+    in.u.list.entries.len = ew.len;
+    n = tundra_encode(&in, buf, sizeof(buf));
+    CHECK(n > 0 && tundra_decode(MSG_ROOM_LIST, buf, (size_t)n, &out) == TUNDRA_DECODE_OK, "room list decodes");
+    it = tundra_reader(out.u.list.entries.p, out.u.list.entries.len);
+    TundraBytes room;
+    uint16_t members = 0;
+    CHECK(tundra_next_room(&it, &room, &members) && bytes_eq(room, "#lobby") && members == 3, "room list entry survives");
+
     if (failures) {
         printf("%d codec test(s) failed\n", failures);
         return 1;
