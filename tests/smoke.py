@@ -34,6 +34,8 @@ results = []
 def check(name, cond):
     results.append(bool(cond))
     print(("ok   - " if cond else "FAIL - ") + name, flush=True)
+    if not cond and os.environ.get("GITHUB_ACTIONS"):
+        print("::error title=smoke::" + name, flush=True)
 
 
 def free_port():
@@ -45,10 +47,14 @@ def free_port():
 
 
 def start(port, wsport, db, extra=()):
-    kwargs = {"stderr": subprocess.PIPE}
+    # log to a file: a pipe nobody reads fills up (about 4 KB on Windows)
+    # and would block the server
+    log = open(db + ".log", "w+b")
+    kwargs = {"stderr": log}
     if WINDOWS:
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     proc = subprocess.Popen([SERVER, "-p", str(port), "-w", str(wsport), "-d", db, *extra], **kwargs)
+    proc.log = log
     for _ in range(100):
         try:
             socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
@@ -68,7 +74,9 @@ def stop(proc):
     except subprocess.TimeoutExpired:
         proc.kill()
         code = None
-    err = proc.stderr.read().decode(errors="replace")
+    proc.log.seek(0)
+    err = proc.log.read().decode(errors="replace")
+    proc.log.close()
     return code, err
 
 
@@ -241,7 +249,8 @@ def main():
     for m in many:
         m.sock.close()
 
-    # a slow reader with a large backlog: the server queues and paces it
+    # a slow reader with a large backlog: the server queues it (under the
+    # 1 MiB per-client cap, beyond which a reader is dropped by design)
     slow = Conn(port)
     slow.send(register(b"slowpoke"))
     slow.wait_for(0x10)
@@ -254,7 +263,7 @@ def main():
     fast.wait_for(0x1A)
     time.sleep(0.2)
     big = b"x" * 4000
-    burst = b"".join(frame(0x08, bytes([0]) + s8(b"#flood") + s16(big + b"%04d" % i)) for i in range(400))
+    burst = b"".join(frame(0x08, bytes([0]) + s8(b"#flood") + s16(big + b"%04d" % i)) for i in range(200))
     fast.send(burst)
     time.sleep(1.0)  # let the slow reader's queue build up
     n = 0
@@ -265,7 +274,7 @@ def main():
         if chat_text(f[1]).endswith("%04d" % n):
             n += 1
         time.sleep(0.001)
-    check("a slow reader drains a 1.6 MB backlog in order", n == 400)
+    check("a slow reader drains an 800 KB backlog in order", n == 200)
     slow.sock.close()
     fast.sock.close()
 
@@ -276,6 +285,9 @@ def main():
     check("no failures logged", "failed" not in err.lower())
     if code != 0 or "failed" in err.lower():
         print(err)
+        if os.environ.get("GITHUB_ACTIONS"):
+            for line in err.splitlines()[-15:]:
+                print("::error title=server log::" + line, flush=True)
 
     # persistence across a restart
     proc = start(port, wsport, db)
