@@ -115,6 +115,7 @@ int main(void) {
         CHECK(!tundra_reg_find(out.u.reg.ext, REG_TOKEN, &v), "absent tag not found");
         CHECK(tundra_decode(MSG_REGISTER, buf, (size_t)n - 1, &out) == TUNDRA_DECODE_MALFORMED,
               "truncated extension rejected");
+    }
 
     /* round trips for the remaining fixed-layout types */
     {
