@@ -40,7 +40,7 @@ static void usage(const char *prog) {
             "  -t  \"username token\" file: listed names must present their token (re-read on SIGHUP)\n"
             "  -A  with -t, every username must be listed\n",
             prog,
-            tls_available() ? "  -C  TLS certificate chain (PEM); with -K, both ports use TLS (wss/https on -w)\n"
+            srv_tls_available() ? "  -C  TLS certificate chain (PEM); with -K, both ports use TLS (wss/https on -w)\n"
                               "  -K  TLS private key (PEM)\n"
                             : "  -C, -K  TLS certificate and key (not in this build: rebuild with OpenSSL)\n");
 }
@@ -66,7 +66,7 @@ int main(int argc, char **argv) {
             case 'g': resume_grace = atoi(optarg); break;
             case 'T': agent_timeout = atoi(optarg); break;
             case 'v': verbose = 1; break;
-            case 'V': printf("tundra %s%s\n", TUNDRA_RELEASE, tls_available() ? " (tls)" : ""); return 0;
+            case 'V': printf("tundra %s%s\n", TUNDRA_RELEASE, srv_tls_available() ? " (tls)" : ""); return 0;
             default: usage(argv[0]); return opt == 'h' ? 0 : 1;
         }
     }
@@ -79,7 +79,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "-C and -K go together\n");
         return 1;
     }
-    if (tls_cert && tls_init(tls_cert, tls_key) < 0) return 1;
+    if (tls_cert && srv_tls_init(tls_cert, tls_key) < 0) return 1;
     if (auth_require_all && !tokens_path) {
         fprintf(stderr, "-A needs -t\n");
         return 1;
@@ -91,7 +91,7 @@ int main(int argc, char **argv) {
 
     if (net_listen(port) < 0) return 1;
     if (ws_port && net_listen_ws(ws_port) < 0) return 1;
-    if (ws_port) log_info("web client and WebSockets on %s://localhost:%d/", tls_enabled() ? "https" : "http", ws_port);
+    if (ws_port) log_info("web client and WebSockets on %s://localhost:%d/", srv_tls_enabled() ? "https" : "http", ws_port);
     log_info("Tundra %s server listening on port %d", TUNDRA_RELEASE, port);
 
     last_ping = mono_s();
@@ -105,7 +105,7 @@ int main(int argc, char **argv) {
     msglog_free();
     plat_shutdown_complete();
     store_close();
-    tls_free();
+    srv_tls_free();
     auth_free();
     return 0;
 }
