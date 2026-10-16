@@ -28,23 +28,30 @@ static void handle_register(Client *c, uint16_t seq, const TundraMsg *m) {
     memcpy(username, uname.p, uname.len);
     username[uname.len] = '\0';
 
-    /* Resume: a non-nil id that matches a live session for the same user. */
+    /* Resume: a non-nil id must match a live session for the same user. */
     if (uuid_compare(m->u.reg.id, nil_uuid) != 0) {
         Session *s = find_session_by_id(m->u.reg.id);
-        if (s && strcmp(s->username, username) == 0) {
-            if (s->state == SESSION_ACTIVE && s->client && s->client != c) {
-                /* the old connection is still attached (e.g. half-open); replace it */
-                mark_dead(s->client);
-            }
-            attach(s, c);
-            char msg[96];
-            snprintf(msg, sizeof(msg), "Welcome back, %s!", username);
-            send_system(c, seq, s->id, msg);
-            backlog_replay(s);
-            log_info("%s resumed session", username);
+        if (!s || strcmp(s->username, username) != 0) {
+            send_error(c, seq, ERR_SESSION_EXPIRED, "Session expired or unknown; register with a zero id");
             return;
         }
-        /* unknown or expired id: fall through to a fresh registration */
+        if (s->state == SESSION_ACTIVE && s->client && s->client != c) {
+            /* the old connection is still attached (e.g. half-open); replace it */
+            mark_dead(s->client);
+        }
+        attach(s, c);
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Welcome back, %s!", username);
+        send_system(c, seq, s->id, msg);
+        if (s->backlog_dropped) {
+            snprintf(msg, sizeof(msg), "%u buffered message(s) were dropped while you were away",
+                     s->backlog_dropped);
+            send_system(c, seq, nil_uuid, msg);
+            s->backlog_dropped = 0;
+        }
+        backlog_pump(s);
+        log_info("%s resumed session", username);
+        return;
     }
 
     if (find_session_by_name(username)) {
@@ -272,7 +279,7 @@ static void handle_history(Client *c, uint16_t seq, const TundraMsg *req) {
 static void handle_agent_command(Client *c, uint16_t seq, const TundraMsg *m) {
     TundraBytes agent = m->u.agent_cmd.agent, cmd = m->u.agent_cmd.command;
     size_t text_len = agent.len + 1 + cmd.len;
-    if (agent.len == 0 || text_len > TUNDRA_MAX_TEXT) {
+    if (!valid_username(agent.p, agent.len) || text_len > TUNDRA_MAX_TEXT) {
         send_error(c, seq, ERR_INVALID_FORMAT, "Invalid agent command");
         return;
     }
@@ -300,17 +307,20 @@ static void handle_agent_command(Client *c, uint16_t seq, const TundraMsg *m) {
 
 /* ---- misc ---- */
 
-static void handle_pong(Client *c) {
-    if (c->ping_sent_ms) {
-        uint64_t rtt = mono_ms() - c->ping_sent_ms;
-        c->session->latency_ms = rtt > UINT32_MAX ? UINT32_MAX : (uint32_t)rtt;
-        c->ping_sent_ms = 0;
-    }
+/* Latency is computed from the timestamp the client echoes back, so a
+ * late answer to an old ping cannot produce a low reading. */
+static void handle_pong(Client *c, TundraBytes data) {
+    if (data.len != 8) return;
+    uint64_t sent = tundra_get_u64(data.p);
+    uint64_t now = wall_ms();
+    if (sent == 0 || sent > now) return;
+    uint64_t rtt = now - sent;
+    c->session->latency_ms = rtt > UINT32_MAX ? UINT32_MAX : (uint32_t)rtt;
 }
 
 static void handle_health_check(Client *c, uint16_t seq) {
     Session *s = c->session;
-    uint64_t uptime = (uint64_t)(mono_s() - s->connected_at) * 1000u;
+    uint64_t uptime = (uint64_t)(mono_s() - c->accepted_at) * 1000u;
     TundraMsg m = { .type = MSG_HEALTH_RESULT };
     m.u.health.ts_ms = wall_ms();
     m.u.health.status = 1;
@@ -333,7 +343,6 @@ void handle_frame(Client *c, const uint8_t *frame, size_t payload_len) {
         close_after_flush(c);
         return;
     }
-    c->last_seen = mono_s();
     log_debug("<- fd %d %s seq %u len %zu", c->fd, tundra_type_name(type), seq, payload_len);
 
     TundraMsg m;
@@ -352,9 +361,11 @@ void handle_frame(Client *c, const uint8_t *frame, size_t payload_len) {
         return;
     }
     if (!c->session) {
+        /* does not refresh last_seen: unregistered clients must register in time */
         send_error(c, seq, ERR_NOT_REGISTERED, "Not registered");
         return;
     }
+    c->last_seen = mono_s();
     c->session->messages_received++;
 
     switch (type) {
@@ -366,7 +377,7 @@ void handle_frame(Client *c, const uint8_t *frame, size_t payload_len) {
         case MSG_WHO:           handle_who(c, seq, m.u.room.room); break;
         case MSG_HISTORY:       handle_history(c, seq, &m); break;
         case MSG_AGENT_COMMAND: handle_agent_command(c, seq, &m); break;
-        case MSG_PONG:          handle_pong(c); break;
+        case MSG_PONG:          handle_pong(c, m.u.pong.data); break;
         case MSG_HEALTH_CHECK:  handle_health_check(c, seq); break;
         default:                send_error(c, seq, ERR_INVALID_FORMAT, "Unknown message type"); break;
     }

@@ -5,6 +5,8 @@
 #include "server.h"
 
 int verbose = 0;
+int idle_timeout = DEFAULT_IDLE_TIMEOUT;
+int resume_grace = DEFAULT_RESUME_GRACE;
 
 void log_info(const char *fmt, ...) {
     va_list ap;

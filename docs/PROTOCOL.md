@@ -8,7 +8,7 @@ Every frame is a 7-byte header followed by `Length` payload bytes. All integers 
 
 ```
 offset 0  version  u8    0x01
-offset 1  flags    u8    reserved, send 0
+offset 1  flags    u8    reserved: send 0, ignored by the server
 offset 2  seq      u16   sequence number
 offset 4  length   u16   payload bytes after the header
 offset 6  type     u8    message type
@@ -30,7 +30,7 @@ A frame is always exactly `7 + length` bytes, so the largest frame is 65542 byte
 | `str16` | `u16` length, then that many bytes |
 | `id16` | 16 raw bytes (a UUID) |
 
-Text is UTF-8 by convention; the server does not inspect it.
+Text is UTF-8 by convention; the server does not inspect it. Chat text is limited to 65,450 bytes so that it fits in every frame that carries it.
 
 ## Names
 
@@ -41,10 +41,10 @@ Text is UTF-8 by convention; the server does not inspect it.
 
 | Type | Code | Payload |
 |------|------|---------|
-| `REGISTER` | 0x01 | `id16 id` `str8 username` |
+| `REGISTER` | 0x01 | `id16 id` `str8 username`. Must be sent within 10 seconds of connecting. |
 | `MESSAGE` | 0x02 | `str16 text`. Shorthand for `SEND` to `#lobby`. |
 | `AGENT_COMMAND` | 0x03 | `str8 agent` `str16 command`. Legacy; broadcast to `#lobby` as `BROADCAST_AGENT`. |
-| `PONG` | 0x04 | echo of the `PING` payload |
+| `PONG` | 0x04 | echo of the `PING` payload. Required: it keeps the connection alive and latency is computed from the echoed timestamp. |
 | `HEALTH_CHECK` | 0x05 | empty |
 | `JOIN` | 0x06 | `str8 room`. Creates the room if needed. |
 | `LEAVE` | 0x07 | `str8 room` |
@@ -76,11 +76,11 @@ Message ids are assigned by the server, are unique, and increase by one per mess
 ## Sessions
 
 1. `REGISTER` with an all-zero id. The welcome `SYSTEM` frame carries your session id, and you are joined to `#lobby` (you get a `ROOM_EVENT` for it).
-2. If the connection drops, the session, its username and its room memberships are held for 2 minutes. Messages for it are buffered, up to 50, oldest dropped first.
-3. `REGISTER` with the same id and username to resume. The backlog is delivered right after the welcome. If the old connection is still open it is closed.
-4. After the hold period the session is released, its username becomes free, and each of its rooms gets a "left" event.
+2. If the connection drops, the session, its username and its room memberships are held for 2 minutes. Frames for it are buffered: up to 50 frames and 1 MiB per session (64 MiB across the server), oldest dropped first.
+3. `REGISTER` with the same id and username to resume. The backlog is delivered right after the welcome, paced so it never overflows the connection; if anything was dropped, a `SYSTEM` notice says how many. If the old connection is still open it is closed. An unknown or expired id, or someone else's id, gets `SESSION_EXPIRED`: register again with a zero id.
+4. After the hold period the session is released, its username becomes free, and each of its rooms gets a "left" event. When the session table is full, the longest-detached session is released early to make room.
 
-Connections that send nothing for 2 minutes are dropped. The server pings every 30 seconds; answering with `PONG` keeps the connection alive and measures latency.
+Registered connections that send nothing for 2 minutes are dropped; the server pings every 30 seconds, so answering with `PONG` is enough. Each client's outgoing queue is capped at 1 MiB; a client that falls further behind is disconnected and loses what was still queued for it.
 
 ## Rooms
 
@@ -100,8 +100,8 @@ Connections that send nothing for 2 minutes are dropped. The server pings every 
 |------|------|------|
 | 0x0001 | `USERNAME_TAKEN` | name in use; the connection is closed |
 | 0x0002 | `INVALID_FORMAT` | malformed frame, unknown type, already registered, message too long |
-| 0x0003 | `SESSION_EXPIRED` | reserved |
-| 0x0004 | `SERVER_ERROR` | server full, out of memory, too many rooms |
+| 0x0003 | `SESSION_EXPIRED` | resume with an unknown or expired session id, or another user's |
+| 0x0004 | `SERVER_ERROR` | no free connection or session slot, out of memory, too many rooms |
 | 0x0005 | `NOT_REGISTERED` | anything but `REGISTER` before registering |
 | 0x0006 | `NO_SUCH_TARGET` | unknown room or user |
 | 0x0007 | `NOT_A_MEMBER` | send, history or leave without membership |

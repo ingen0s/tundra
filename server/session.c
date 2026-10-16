@@ -35,14 +35,29 @@ Session *find_session_by_bytes(TundraBytes name) {
     return NULL;
 }
 
+void release_session(Session *s) {
+    log_info("%s session released", s->username);
+    backlog_clear(s);
+    rooms_remove_session(s); /* sends "left" events */
+    s->state = SESSION_FREE;
+}
+
+/* A free slot, or else the longest-detached session is released to make
+ * room, so abandoned sessions cannot lock new users out. */
 Session *alloc_session(void) {
+    Session *oldest = NULL;
     for (int i = 0; i < MAX_SESSIONS; i++) {
-        if (sessions[i].state == SESSION_FREE) {
-            memset(&sessions[i], 0, sizeof(sessions[i]));
-            return &sessions[i];
+        Session *s = &sessions[i];
+        if (s->state == SESSION_FREE) {
+            memset(s, 0, sizeof(*s));
+            return s;
         }
+        if (s->state == SESSION_DETACHED && (!oldest || s->detached_at < oldest->detached_at)) oldest = s;
     }
-    return NULL;
+    if (!oldest) return NULL;
+    release_session(oldest);
+    memset(oldest, 0, sizeof(*oldest));
+    return oldest;
 }
 
 void attach(Session *s, Client *c) {
@@ -62,50 +77,76 @@ void detach(Client *c) {
 
 /* ---- backlog ---- */
 
+static size_t total_backlog_bytes = 0;
+
+static BufferedFrame *backlog_at(Session *s, size_t i) {
+    return &s->backlog[(s->backlog_head + i) % MAX_BUFFERED_MESSAGES];
+}
+
+/* Removes the oldest entry and returns it; the caller owns the payload. */
+static BufferedFrame backlog_pop(Session *s) {
+    BufferedFrame *f = backlog_at(s, 0);
+    BufferedFrame item = *f;
+    f->payload = NULL;
+    s->backlog_head = (s->backlog_head + 1) % MAX_BUFFERED_MESSAGES;
+    s->backlog_count--;
+    s->backlog_bytes -= item.len;
+    total_backlog_bytes -= item.len;
+    return item;
+}
+
 void backlog_clear(Session *s) {
-    for (size_t i = 0; i < s->backlog_count; i++) {
-        free(s->backlog[(s->backlog_head + i) % MAX_BUFFERED_MESSAGES].payload);
-    }
+    while (s->backlog_count > 0) free(backlog_pop(s).payload);
     s->backlog_head = 0;
-    s->backlog_count = 0;
+    s->backlog_dropped = 0;
 }
 
 static void backlog_push(Session *s, uint8_t type, const uint8_t *payload, size_t len) {
-    uint8_t *copy = malloc(len ? len : 1);
-    if (!copy) return;
-    if (len) memcpy(copy, payload, len);
-    if (s->backlog_count == MAX_BUFFERED_MESSAGES) {
-        free(s->backlog[s->backlog_head].payload);
-        s->backlog_head = (s->backlog_head + 1) % MAX_BUFFERED_MESSAGES;
-        s->backlog_count--;
+    /* make room in this session: by count and by bytes, oldest first */
+    while (s->backlog_count > 0 &&
+           (s->backlog_count == MAX_BUFFERED_MESSAGES || s->backlog_bytes + len > MAX_BACKLOG_BYTES)) {
+        free(backlog_pop(s).payload);
+        s->backlog_dropped++;
     }
-    size_t idx = (s->backlog_head + s->backlog_count) % MAX_BUFFERED_MESSAGES;
-    s->backlog[idx].type = type;
-    s->backlog[idx].payload = copy;
-    s->backlog[idx].len = len;
+    /* the global budget protects the server from many detached sessions */
+    if (len > MAX_BACKLOG_BYTES || total_backlog_bytes + len > MAX_TOTAL_BACKLOG) {
+        s->backlog_dropped++;
+        return;
+    }
+    uint8_t *copy = malloc(len ? len : 1);
+    if (!copy) {
+        s->backlog_dropped++;
+        return;
+    }
+    if (len) memcpy(copy, payload, len);
+    BufferedFrame *f = backlog_at(s, s->backlog_count);
+    f->type = type;
+    f->payload = copy;
+    f->len = len;
     s->backlog_count++;
+    s->backlog_bytes += len;
+    total_backlog_bytes += len;
 }
 
-void backlog_replay(Session *s) {
-    /* Take ownership of the entries first: a send can fail and detach the
-     * session, and must not see (or append to) the list being replayed. */
-    BufferedFrame items[MAX_BUFFERED_MESSAGES];
-    size_t count = s->backlog_count;
-    for (size_t i = 0; i < count; i++) items[i] = s->backlog[(s->backlog_head + i) % MAX_BUFFERED_MESSAGES];
-    s->backlog_head = 0;
-    s->backlog_count = 0;
-
-    for (size_t i = 0; i < count; i++) {
-        if (s->state == SESSION_ACTIVE && s->client) push_frame(s->client, items[i].type, items[i].payload, items[i].len);
-        free(items[i].payload);
+void backlog_pump(Session *s) {
+    if (s->pumping) return; /* re-entered via push_frame -> flush_client */
+    s->pumping = 1;
+    while (s->backlog_count > 0 && s->state == SESSION_ACTIVE && s->client && !s->client->dead) {
+        Client *c = s->client;
+        if (c->out_len > 0 && c->out_len + TUNDRA_HEADER_LEN + backlog_at(s, 0)->len > REPLAY_HIGH_WATER) break;
+        BufferedFrame item = backlog_pop(s);
+        push_frame(c, item.type, item.payload, item.len);
+        free(item.payload);
     }
+    s->pumping = 0;
 }
 
 void deliver(Session *s, uint8_t type, const uint8_t *payload, size_t len) {
-    if (s->state == SESSION_ACTIVE && s->client) {
+    if (s->state == SESSION_ACTIVE && s->client && s->backlog_count == 0) {
         push_frame(s->client, type, payload, len);
-    } else if (s->state == SESSION_DETACHED) {
+    } else if (s->state != SESSION_FREE) {
         backlog_push(s, type, payload, len);
+        if (s->state == SESSION_ACTIVE) backlog_pump(s);
     }
 }
 
@@ -115,19 +156,18 @@ void sessions_expire(void) {
     time_t now = mono_s();
     for (int i = 0; i < MAX_CLIENTS; i++) {
         Client *c = &clients[i];
-        if (c->fd >= 0 && !c->dead && now - c->last_seen > IDLE_TIMEOUT) {
+        if (c->fd < 0 || c->dead) continue;
+        if (!c->session && now - c->accepted_at > REGISTER_TIMEOUT) {
+            log_info("fd %d did not register in time", c->fd);
+            mark_dead(c);
+        } else if (c->session && now - c->last_seen > idle_timeout) {
             log_info("fd %d idle timeout", c->fd);
             mark_dead(c);
         }
     }
     for (int i = 0; i < MAX_SESSIONS; i++) {
         Session *s = &sessions[i];
-        if (s->state == SESSION_DETACHED && now - s->detached_at > RESUME_GRACE) {
-            log_info("%s session expired", s->username);
-            backlog_clear(s);
-            rooms_remove_session(s); /* sends "left" events */
-            s->state = SESSION_FREE;
-        }
+        if (s->state == SESSION_DETACHED && now - s->detached_at > resume_grace) release_session(s);
     }
 }
 
@@ -137,7 +177,6 @@ void sessions_ping(void) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
         Client *c = &clients[i];
         if (c->fd < 0 || c->dead || !c->session) continue;
-        c->ping_sent_ms = mono_ms();
         push_frame(c, MSG_PING, buf, sizeof(buf));
     }
 }

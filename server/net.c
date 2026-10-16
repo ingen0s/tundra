@@ -54,6 +54,11 @@ static void flush_client(Client *c) {
         c->out_len -= off;
     }
     if (c->dead) return;
+    /* room freed up: continue any backlog replay */
+    if (c->session && c->session->backlog_count > 0 && c->out_len < REPLAY_HIGH_WATER) {
+        backlog_pump(c->session);
+        if (c->dead) return;
+    }
     set_epollout(c, c->out_len > 0);
     if (c->out_len == 0 && c->close_after_flush) mark_dead(c);
 }
@@ -71,6 +76,7 @@ void send_frame(Client *c, uint8_t type, uint16_t seq, const uint8_t *payload, s
     }
     size_t need = c->out_len + TUNDRA_HEADER_LEN + len;
     if (need > MAX_OUTBOUND_BYTES) {
+        /* Frames still queued for this client are lost. */
         log_info("fd %d exceeded outbound limit, disconnecting", c->fd);
         mark_dead(c);
         return;
@@ -118,11 +124,18 @@ static TundraBytes cbytes(const char *s) {
     return b;
 }
 
-void send_error(Client *c, uint16_t seq, uint16_t code, const char *text) {
+size_t build_error(uint8_t *buf, size_t cap, uint16_t code, const char *text) {
     TundraMsg m = { .type = MSG_ERROR };
     m.u.error.code = code;
     m.u.error.text = cbytes(text);
-    send_msg(c, &m, seq, 0);
+    long n = tundra_encode(&m, buf, cap);
+    return n < 0 ? 0 : (size_t)n;
+}
+
+void send_error(Client *c, uint16_t seq, uint16_t code, const char *text) {
+    uint8_t buf[4 + 256];
+    size_t n = build_error(buf, sizeof(buf), code, text);
+    if (n) send_frame(c, MSG_ERROR, seq, buf, n);
 }
 
 void send_system(Client *c, uint16_t seq, const uuid_t id, const char *text) {
@@ -164,7 +177,7 @@ static Client *alloc_client(int fd) {
             Client *c = &clients[i];
             memset(c, 0, offsetof(Client, in));
             c->fd = fd;
-            c->last_seen = mono_s();
+            c->accepted_at = c->last_seen = mono_s();
             return c;
         }
     }
@@ -189,7 +202,9 @@ static void process_input(Client *c) {
 }
 
 static void read_client(Client *c) {
-    while (!c->dead && !c->close_after_flush) {
+    /* Bounded so one busy client cannot starve the rest; epoll is
+     * level-triggered and reports the socket again if data remains. */
+    for (int i = 0; i < MAX_READS_PER_EVENT && !c->dead && !c->close_after_flush; i++) {
         /* The buffer holds one maximum-size frame and complete frames are
          * consumed after every read, so there is always room here. */
         ssize_t n = recv(c->fd, c->in + c->in_len, sizeof(c->in) - c->in_len, 0);
@@ -208,6 +223,15 @@ static void read_client(Client *c) {
     }
 }
 
+static void reject_full(int fd) {
+    uint8_t frame[TUNDRA_HEADER_LEN + 4 + 256];
+    size_t len = build_error(frame + TUNDRA_HEADER_LEN, sizeof(frame) - TUNDRA_HEADER_LEN, ERR_SERVER_ERROR, "Server full");
+    tundra_put_header(frame, MSG_ERROR, 0, len);
+    ssize_t ignored = send(fd, frame, TUNDRA_HEADER_LEN + len, MSG_NOSIGNAL | MSG_DONTWAIT);
+    (void)ignored;
+    close(fd);
+}
+
 static void accept_clients(void) {
     for (;;) {
         int fd = accept4(server_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
@@ -219,7 +243,7 @@ static void accept_clients(void) {
         Client *c = alloc_client(fd);
         if (!c) {
             log_info("no free client slots, rejecting fd %d", fd);
-            close(fd);
+            reject_full(fd);
             continue;
         }
         struct epoll_event ev = {0};

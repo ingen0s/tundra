@@ -12,7 +12,7 @@ Early but tested. The server is single-threaded on Linux epoll, handles up to 1,
 - **Rooms:** join, leave, list, who's here. Everyone starts in `#lobby`.
 - **Direct messages** between users.
 - **Message ids and history:** every message gets a server-assigned id; the most recent 10,000 are kept in memory and can be paged with `HISTORY`.
-- **Session resume:** a dropped connection keeps its name and rooms for 2 minutes; reconnecting with the session id delivers what was missed (up to 50 messages).
+- **Session resume:** a dropped connection keeps its name and rooms for 2 minutes; reconnecting with the session id delivers what was missed (up to 50 messages / 1 MiB, paced so a large catch-up never overflows the connection).
 - **Health:** ping/pong latency and per-session counters via `HEALTH_CHECK`.
 - **Backpressure:** each client's outgoing queue is capped at 1 MiB; clients that can't keep up are disconnected instead of stalling the server.
 
@@ -21,7 +21,7 @@ Early but tested. The server is single-threaded on Linux epoll, handles up to 1,
 ```bash
 sudo apt-get install uuid-dev
 make
-./build/tundra_chat_server            # listens on 4242; -p PORT, -v for frame logging
+./build/tundra_chat_server            # listens on 4242; -p PORT, -i idle s, -g resume grace s, -v frame log
 ```
 
 In two more terminals:
@@ -73,16 +73,18 @@ Adding a message type: define it in `tundra_protocol.h`, add decode/encode and a
 
 ## Configuration
 
-Compile-time constants in `server/server.h`:
+Compile-time constants in `server/server.h` (two have command-line overrides):
 
 | Constant | Default | Meaning |
 |----------|---------|---------|
 | `MAX_CLIENTS` | 1000 | concurrent connections |
 | `MAX_ROOMS` | 256 | rooms |
-| `IDLE_TIMEOUT` | 120 s | drop connections that send nothing |
-| `RESUME_GRACE` | 120 s | how long a disconnected session is held |
+| `DEFAULT_IDLE_TIMEOUT` | 120 s | drop connections that send nothing (`-i`) |
+| `DEFAULT_RESUME_GRACE` | 120 s | how long a disconnected session is held (`-g`) |
+| `REGISTER_TIMEOUT` | 10 s | time a new connection has to register |
 | `PING_INTERVAL` | 30 s | server pings |
-| `MAX_BUFFERED_MESSAGES` | 50 | backlog per disconnected session |
+| `MAX_BUFFERED_MESSAGES` / `MAX_BACKLOG_BYTES` | 50 / 1 MiB | backlog per disconnected session |
+| `MAX_TOTAL_BACKLOG` | 64 MiB | all backlogs together |
 | `MAX_OUTBOUND_BYTES` | 1 MiB | outgoing queue per client |
 | `MSGLOG_CAPACITY` / `MSGLOG_MAX_BYTES` | 10,000 / 64 MiB | history kept in memory |
 

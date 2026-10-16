@@ -16,20 +16,22 @@ static void tick(void) {
 }
 
 static void usage(const char *prog) {
-    fprintf(stderr, "usage: %s [-p port] [-v]\n", prog);
+    fprintf(stderr, "usage: %s [-p port] [-i idle-timeout-s] [-g resume-grace-s] [-v]\n", prog);
 }
 
 int main(int argc, char **argv) {
     int port = DEFAULT_PORT;
     int opt;
-    while ((opt = getopt(argc, argv, "p:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "p:i:g:vh")) != -1) {
         switch (opt) {
             case 'p': port = atoi(optarg); break;
+            case 'i': idle_timeout = atoi(optarg); break;
+            case 'g': resume_grace = atoi(optarg); break;
             case 'v': verbose = 1; break;
             default: usage(argv[0]); return opt == 'h' ? 0 : 1;
         }
     }
-    if (port <= 0 || port > 65535) {
+    if (port <= 0 || port > 65535 || idle_timeout <= 0 || resume_grace < 0) {
         usage(argv[0]);
         return 1;
     }

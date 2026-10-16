@@ -13,11 +13,16 @@
 #define MAX_SESSIONS          MAX_CLIENTS
 #define MAX_ROOMS             256
 #define LOBBY                 "#lobby"
-#define IDLE_TIMEOUT          120       /* seconds without any frame before a connection is dropped */
-#define RESUME_GRACE          120       /* seconds a disconnected session is held for reconnect */
+#define DEFAULT_IDLE_TIMEOUT  120       /* seconds without any frame before a connection is dropped */
+#define DEFAULT_RESUME_GRACE  120       /* seconds a disconnected session is held for reconnect */
+#define REGISTER_TIMEOUT      10        /* seconds a new connection has to send REGISTER */
 #define PING_INTERVAL         30        /* seconds */
-#define MAX_BUFFERED_MESSAGES 50        /* per disconnected session; oldest dropped first */
-#define MAX_OUTBOUND_BYTES    (1 << 20) /* per client; slower clients are disconnected */
+#define MAX_BUFFERED_MESSAGES 50        /* per session backlog; oldest dropped first */
+#define MAX_BACKLOG_BYTES     (1u << 20)   /* per session backlog */
+#define MAX_TOTAL_BACKLOG     (64u << 20)  /* all backlogs together */
+#define MAX_OUTBOUND_BYTES    (1u << 20)   /* per client; slower clients are disconnected */
+#define REPLAY_HIGH_WATER     (256u << 10) /* backlog replay pauses while this much is queued */
+#define MAX_READS_PER_EVENT   16           /* fairness: other clients get a turn */
 #define MSGLOG_CAPACITY       10000     /* recent messages kept in memory for history */
 #define MSGLOG_MAX_BYTES      (64u << 20) /* and at most this much message text */
 
@@ -39,9 +44,15 @@ typedef struct Session {
     time_t connected_at;
     time_t detached_at;
     uint16_t out_seq;           /* sequence counter for server-initiated frames */
+    /* Frames waiting for this session, oldest first. Filled while the
+     * session is detached, and while an earlier backlog is still being
+     * replayed (so live frames never overtake buffered ones). */
     BufferedFrame backlog[MAX_BUFFERED_MESSAGES];
     size_t backlog_head;        /* index of oldest entry */
     size_t backlog_count;
+    size_t backlog_bytes;
+    uint32_t backlog_dropped;   /* frames dropped since the last resume */
+    int pumping;                /* backlog_pump is on the stack */
     uint32_t latency_ms;
     uint32_t messages_sent;
     uint32_t messages_received;
@@ -53,8 +64,8 @@ typedef struct Client {
     int close_after_flush;
     int want_write;             /* EPOLLOUT currently registered */
     Session *session;
+    time_t accepted_at;
     time_t last_seen;
-    uint64_t ping_sent_ms;
     uint8_t *out;
     size_t out_len;
     size_t out_cap;
@@ -72,6 +83,8 @@ typedef struct {
 extern Client clients[MAX_CLIENTS];
 extern Session sessions[MAX_SESSIONS];
 extern int verbose;
+extern int idle_timeout;
+extern int resume_grace;
 
 /* ---- util.c ---- */
 void log_info(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -95,6 +108,7 @@ void push_frame(Client *c, uint8_t type, const uint8_t *payload, size_t len);
 /* Encodes `msg` and sends it as a reply (seq) or push (when push != 0). */
 void send_msg(Client *c, const TundraMsg *msg, uint16_t seq, int push);
 void send_error(Client *c, uint16_t seq, uint16_t code, const char *text);
+size_t build_error(uint8_t *buf, size_t cap, uint16_t code, const char *text);
 void send_system(Client *c, uint16_t seq, const uuid_t id, const char *text);
 
 /* ---- session.c ---- */
@@ -102,12 +116,15 @@ int session_index(const Session *s);
 Session *find_session_by_id(const uuid_t id);
 Session *find_session_by_name(const char *name);
 Session *find_session_by_bytes(TundraBytes name);
-Session *alloc_session(void);
+Session *alloc_session(void); /* may release the longest-detached session */
+void release_session(Session *s);
 void attach(Session *s, Client *c);
 void detach(Client *c);
 /* Delivers a frame to a session: sent now if online, buffered if detached. */
 void deliver(Session *s, uint8_t type, const uint8_t *payload, size_t len);
-void backlog_replay(Session *s);
+/* Sends buffered frames while the connection has room; the rest follow
+ * from flush_client as the socket drains. */
+void backlog_pump(Session *s);
 void backlog_clear(Session *s);
 void sessions_expire(void);
 void sessions_ping(void);
