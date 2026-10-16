@@ -57,7 +57,7 @@ Client message types are 0x01-0x0F and 0x20-0x2F; server message types are 0x10-
 | `WHO` | 0x0C | `str8 room` |
 | `AGENT_ADVERTISE` | 0x20 | `str16 capabilities` (opaque, usually JSON, up to 8 KiB). Empty stops being an agent. |
 | `AGENT_REQUEST` | 0x21 | `str8 agent` `u64 req_id` `str16 body`. `req_id` is chosen by the requester. |
-| `AGENT_RESPONSE` | 0x22 | `str8 requester` `u64 req_id` `u8 status` `u8 final` `str16 body` |
+| `AGENT_RESPONSE` | 0x22 | `str8 requester` `u64 handle` `u8 status` `u8 final` `str16 body`. `handle` is the one from `AGENT_REQUEST_IN`. |
 | `LIST_AGENTS` | 0x23 | empty |
 
 ## Server to client
@@ -75,8 +75,8 @@ Client message types are 0x01-0x0F and 0x20-0x2F; server message types are 0x10-
 | `ROOM_EVENT` | 0x1A | `u8 event` `str8 room` `str8 user`. Event 1 = joined, 2 = left. |
 | `HISTORY_RESULT` | 0x1B | `str8 room` `u16 count`, then `count` x (`u16 len` + a `CHAT` payload), oldest first |
 | `WHO_RESULT` | 0x1C | `str8 room` `u16 count`, then `count` x (`str8 user` `u8 online`) |
-| `AGENT_LIST` | 0x30 | `u16 count`, then `count` x (`str8 name` `u8 online` `str16 capabilities`) |
-| `AGENT_REQUEST_IN` | 0x31 | `str8 requester` `u64 req_id` `str16 body` |
+| `AGENT_LIST` | 0x30 | `u8 truncated` `u16 count`, then `count` x (`str8 name` `u8 online` `str16 capabilities`). `truncated` is 1 when more agents exist than fit in one frame. |
+| `AGENT_REQUEST_IN` | 0x31 | `str8 requester` `u64 handle` `str16 body`. `handle` is assigned by the server. |
 | `AGENT_RESPONSE_IN` | 0x32 | `str8 agent` `u64 req_id` `u8 status` `u8 final` `str16 body` |
 
 `BROADCAST_MESSAGE` (0x11) and `IMAGE` (0x13) are reserved and not sent.
@@ -136,9 +136,10 @@ All catch-up is paced: it is sent only while the connection has less than 256 Ki
 Agents are ordinary sessions that advertise capabilities. The server routes typed requests to them and their responses back, without interpreting either body.
 
 1. An agent sends `AGENT_ADVERTISE`. `LIST_AGENTS` shows every advertised agent, whether it is online, and its capabilities.
-2. A client sends `AGENT_REQUEST` with a request id of its choosing. The agent receives `AGENT_REQUEST_IN` naming the requester. If the agent is briefly disconnected, the request waits in its backlog.
-3. The agent answers with `AGENT_RESPONSE` naming the requester and request id. It may send any number of partial responses (`final` = 0) followed by one final response (`final` = 1). The requester receives each as `AGENT_RESPONSE_IN`.
-4. The server only accepts a response that matches an open request sent to that agent, so agents cannot answer requests they were not given.
+2. A client sends `AGENT_REQUEST` with a request id of its choosing. The agent receives `AGENT_REQUEST_IN` naming the requester and carrying a server-assigned **handle**. Handles are never reused, so an answer to a request that has already been closed can never be mistaken for an answer to a newer one, even if the requester reuses its id. If the agent is briefly disconnected, the request waits in its backlog; if the backlog overflows and drops it, the requester gets `UNAVAILABLE` right away.
+3. The agent answers with `AGENT_RESPONSE` giving the requester and the handle. It may send any number of partial responses (`final` = 0) followed by one final response (`final` = 1). The requester receives each as `AGENT_RESPONSE_IN` with its own request id.
+4. The server only accepts a response whose handle belongs to an open request sent to that agent, so agents cannot answer requests they were not given or that have already closed.
+5. An agent that sends an empty `AGENT_ADVERTISE` stops being an agent; its open requests are closed with `UNAVAILABLE`.
 
 | Status | Name | Sent by |
 |--------|------|---------|
@@ -146,9 +147,9 @@ Agents are ordinary sessions that advertise capabilities. The server routes type
 | 1 | `ERROR` | agent |
 | 2 | `REJECTED` | agent |
 | 3 | `TIMEOUT` | server, when no response arrives for 60 seconds (`-T`); each partial response restarts the clock |
-| 4 | `UNAVAILABLE` | server, when the agent's session ends with the request open |
+| 4 | `UNAVAILABLE` | server, when the agent's session ends, it stops advertising, or the request is dropped from its full backlog |
 
-Limits: a requester may have 64 open requests (4,096 across the server), and a request id may not be reused while its request is open.
+Limits: a requester may have 64 open requests, an agent 256, and the server 4,096; a request id may not be reused while its request is open.
 
 `AGENT_COMMAND` (0x03) is the older, untyped form: it broadcasts `"<agent> <command>"` to `#lobby` as `BROADCAST_AGENT` and is kept for compatibility.
 

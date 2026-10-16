@@ -26,6 +26,7 @@
 #define MAX_READS_PER_EVENT   16           /* fairness: other clients get a turn */
 #define MAX_PENDING_REQUESTS  4096         /* open agent requests, server-wide */
 #define MAX_PENDING_PER_SESSION 64         /* open agent requests per requester */
+#define MAX_PENDING_PER_AGENT 256          /* open agent requests per agent */
 #define DEFAULT_AGENT_TIMEOUT 60           /* seconds an agent request may stay open */
 #define MSGLOG_CAPACITY       10000     /* recent messages kept in memory for history */
 #define MSGLOG_MAX_BYTES      (64u << 20) /* and at most this much message text */
@@ -230,6 +231,8 @@ void handle_list_agents(Client *c, uint16_t seq);
 void agents_expire(void);
 /* Closes requests to and from `s`, and forgets its capabilities. */
 void agents_session_released(Session *s);
+/* An AGENT_REQUEST_IN frame was dropped from a backlog: closes its request. */
+void agents_request_dropped(const uint8_t *payload, size_t len);
 
 /* ---- handlers.c ---- */
 void handle_frame(Client *c, const uint8_t *frame, size_t payload_len);

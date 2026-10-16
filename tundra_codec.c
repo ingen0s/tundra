@@ -180,7 +180,12 @@ int tundra_decode(uint8_t type, const uint8_t *payload, size_t len, TundraMsg *o
             out->u.room_event.user = rd_str8(&r);
             break;
         case MSG_ROOM_LIST:
+            out->u.list.count = tundra_rd_u16(&r);
+            read_list(&r, type, out->u.list.count, &out->u.list.entries);
+            break;
         case MSG_AGENT_LIST:
+            out->u.list.truncated = tundra_rd_u8(&r);
+            if (out->u.list.truncated > 1) r.ok = 0;
             out->u.list.count = tundra_rd_u16(&r);
             read_list(&r, type, out->u.list.count, &out->u.list.entries);
             break;
@@ -340,7 +345,12 @@ long tundra_encode(const TundraMsg *m, uint8_t *buf, size_t cap) {
             wr_str8(&w, m->u.room_event.user);
             break;
         case MSG_ROOM_LIST:
+            tundra_wr_u16(&w, m->u.list.count);
+            tundra_wr_bytes(&w, m->u.list.entries.p, m->u.list.entries.len);
+            break;
         case MSG_AGENT_LIST:
+            if (m->u.list.truncated > 1) w.ok = 0;
+            tundra_wr_u8(&w, m->u.list.truncated);
             tundra_wr_u16(&w, m->u.list.count);
             tundra_wr_bytes(&w, m->u.list.entries.p, m->u.list.entries.len);
             break;

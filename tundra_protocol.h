@@ -76,7 +76,7 @@ enum TundraMessageType {
                                      [len(2) CHAT payload], oldest first              */
     MSG_WHO_RESULT        = 0x1C, /* rlen(1) room count(2) then count x
                                      [ulen(1) user online(1)]                         */
-    MSG_AGENT_LIST        = 0x30, /* count(2) then count x
+    MSG_AGENT_LIST        = 0x30, /* truncated(1) count(2) then count x
                                      [nlen(1) name online(1) clen(2) capabilities]    */
     MSG_AGENT_REQUEST_IN  = 0x31, /* flen(1) from req_id(8) blen(2) body              */
     MSG_AGENT_RESPONSE_IN = 0x32  /* alen(1) agent req_id(8) status(1) final(1)

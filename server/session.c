@@ -103,21 +103,29 @@ void backlog_clear(Session *s) {
     s->backlog_dropped = 0;
 }
 
+/* A buffered frame was dropped: count it, and close an agent request
+ * right away instead of letting its requester wait for the timeout. */
+static void frame_dropped(Session *s, uint8_t type, const uint8_t *payload, size_t len) {
+    s->backlog_dropped++;
+    if (type == MSG_AGENT_REQUEST_IN) agents_request_dropped(payload, len);
+}
+
 static void backlog_push(Session *s, uint8_t type, const uint8_t *payload, size_t len) {
     /* make room in this session: by count and by bytes, oldest first */
     while (s->backlog_count > 0 &&
            (s->backlog_count == MAX_BUFFERED_MESSAGES || s->backlog_bytes + len > MAX_BACKLOG_BYTES)) {
-        free(backlog_pop(s).payload);
-        s->backlog_dropped++;
+        BufferedFrame old = backlog_pop(s);
+        frame_dropped(s, old.type, old.payload, old.len);
+        free(old.payload);
     }
     /* the global budget protects the server from many detached sessions */
     if (len > MAX_BACKLOG_BYTES || total_backlog_bytes + len > MAX_TOTAL_BACKLOG) {
-        s->backlog_dropped++;
+        frame_dropped(s, type, payload, len);
         return;
     }
     uint8_t *copy = malloc(len ? len : 1);
     if (!copy) {
-        s->backlog_dropped++;
+        frame_dropped(s, type, payload, len);
         return;
     }
     if (len) memcpy(copy, payload, len);

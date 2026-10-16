@@ -17,11 +17,15 @@ typedef struct {
     int used;
     Session *requester;
     Session *agent;
-    uint64_t req_id;
+    uint64_t req_id;     /* the requester's id, echoed back to it */
+    uint64_t handle;     /* server-assigned id the agent sees and answers */
     uint64_t deadline_ms;
 } Pending;
 
 static Pending pending[MAX_PENDING_REQUESTS];
+/* Handles are never reused, so an answer to a request that already timed
+ * out (or was otherwise closed) can never match a newer request. */
+static uint64_t next_handle = 1;
 int agent_timeout = DEFAULT_AGENT_TIMEOUT;
 
 static TundraBytes cstr(const char *s) {
@@ -37,10 +41,25 @@ static Pending *find_pending(const Session *requester, uint64_t req_id) {
     return NULL;
 }
 
-static int pending_count(const Session *requester) {
+static Pending *find_handle(uint64_t handle) {
+    for (int i = 0; i < MAX_PENDING_REQUESTS; i++) {
+        if (pending[i].used && pending[i].handle == handle) return &pending[i];
+    }
+    return NULL;
+}
+
+static int count_requester(const Session *requester) {
     int n = 0;
     for (int i = 0; i < MAX_PENDING_REQUESTS; i++) {
         if (pending[i].used && pending[i].requester == requester) n++;
+    }
+    return n;
+}
+
+static int count_agent(const Session *agent) {
+    int n = 0;
+    for (int i = 0; i < MAX_PENDING_REQUESTS; i++) {
+        if (pending[i].used && pending[i].agent == agent) n++;
     }
     return n;
 }
@@ -58,12 +77,23 @@ static void server_response(Pending *p, uint8_t status, const char *text) {
     if (n >= 0) deliver(p->requester, MSG_AGENT_RESPONSE_IN, buf, (size_t)n);
 }
 
+/* Closes every open request to `agent` with UNAVAILABLE. */
+static void close_requests_to(Session *agent, const char *why) {
+    for (int i = 0; i < MAX_PENDING_REQUESTS; i++) {
+        Pending *p = &pending[i];
+        if (!p->used || p->agent != agent) continue;
+        p->used = 0; /* first, so a re-entrant delivery cannot see it */
+        if (p->requester != agent) server_response(p, AGENT_UNAVAILABLE, why);
+    }
+}
+
 void handle_agent_advertise(Client *c, uint16_t seq, TundraBytes caps) {
     Session *s = c->session;
     if (caps.len > TUNDRA_MAX_CAPABILITIES) {
         send_error(c, seq, ERR_INVALID_FORMAT, "Capabilities too large");
         return;
     }
+    if (caps.len == 0 && s->is_agent) close_requests_to(s, "The agent stopped taking requests");
     free(s->capabilities);
     s->capabilities = NULL;
     s->capabilities_len = 0;
@@ -100,8 +130,12 @@ void handle_agent_request(Client *c, uint16_t seq, const TundraMsg *m) {
         send_error(c, seq, ERR_BAD_REQUEST, "Request id already in use");
         return;
     }
-    if (pending_count(me) >= MAX_PENDING_PER_SESSION) {
+    if (count_requester(me) >= MAX_PENDING_PER_SESSION) {
         send_error(c, seq, ERR_BAD_REQUEST, "Too many pending requests");
+        return;
+    }
+    if (count_agent(agent) >= MAX_PENDING_PER_AGENT) {
+        send_error(c, seq, ERR_BAD_REQUEST, "That agent has too many pending requests");
         return;
     }
     Pending *p = NULL;
@@ -116,11 +150,12 @@ void handle_agent_request(Client *c, uint16_t seq, const TundraMsg *m) {
     p->requester = me;
     p->agent = agent;
     p->req_id = m->u.agent_req.req_id;
+    p->handle = next_handle++;
     p->deadline_ms = mono_ms() + (uint64_t)agent_timeout * 1000u;
 
     TundraMsg out = { .type = MSG_AGENT_REQUEST_IN };
     out.u.agent_req.peer = cstr(me->username);
-    out.u.agent_req.req_id = p->req_id;
+    out.u.agent_req.req_id = p->handle;
     out.u.agent_req.body = m->u.agent_req.body;
     static uint8_t buf[TUNDRA_MAX_PAYLOAD];
     long n = tundra_encode(&out, buf, sizeof(buf));
@@ -135,12 +170,12 @@ void handle_agent_request(Client *c, uint16_t seq, const TundraMsg *m) {
 
 void handle_agent_response(Client *c, uint16_t seq, const TundraMsg *m) {
     Session *me = c->session;
-    Session *requester = find_session_by_bytes(m->u.agent_resp.peer);
-    Pending *p = requester ? find_pending(requester, m->u.agent_resp.req_id) : NULL;
-    if (!p || p->agent != me) {
+    Pending *p = find_handle(m->u.agent_resp.req_id);
+    if (!p || p->agent != me || find_session_by_bytes(m->u.agent_resp.peer) != p->requester) {
         send_error(c, seq, ERR_BAD_REQUEST, "No such open request");
         return;
     }
+    Session *requester = p->requester;
     if (m->u.agent_resp.body.len > TUNDRA_MAX_TEXT) {
         send_error(c, seq, ERR_INVALID_FORMAT, "Response too long");
         return;
@@ -174,8 +209,9 @@ void handle_agent_response(Client *c, uint16_t seq, const TundraMsg *m) {
 
 void handle_list_agents(Client *c, uint16_t seq) {
     static uint8_t entries[TUNDRA_MAX_PAYLOAD];
-    TundraWriter w = tundra_writer(entries, TUNDRA_MAX_PAYLOAD - 2);
+    TundraWriter w = tundra_writer(entries, TUNDRA_MAX_PAYLOAD - 3);
     uint16_t count = 0;
+    uint8_t truncated = 0;
     for (int i = 0; i < MAX_SESSIONS; i++) {
         Session *s = &sessions[i];
         if (s->state == SESSION_FREE || !s->is_agent) continue;
@@ -183,14 +219,16 @@ void handle_list_agents(Client *c, uint16_t seq) {
         TundraBytes caps = { s->capabilities, s->capabilities_len };
         tundra_wr_agent_entry(&w, cstr(s->username), s->state == SESSION_ACTIVE, caps);
         if (!w.ok) {
-            /* list is full: stop at the last entry that fit */
+            /* list is full: stop at the last entry that fit and say so */
             w.ok = 1;
             w.len = before;
+            truncated = 1;
             break;
         }
         count++;
     }
     TundraMsg m = { .type = MSG_AGENT_LIST };
+    m.u.list.truncated = truncated;
     m.u.list.count = count;
     m.u.list.entries.p = entries;
     m.u.list.entries.len = w.len;
@@ -202,10 +240,19 @@ void agents_expire(void) {
     for (int i = 0; i < MAX_PENDING_REQUESTS; i++) {
         Pending *p = &pending[i];
         if (p->used && now >= p->deadline_ms) {
-            server_response(p, AGENT_TIMEOUT, "The agent did not answer in time");
             p->used = 0;
+            server_response(p, AGENT_TIMEOUT, "The agent did not answer in time");
         }
     }
+}
+
+void agents_request_dropped(const uint8_t *payload, size_t len) {
+    TundraMsg m;
+    if (tundra_decode(MSG_AGENT_REQUEST_IN, payload, len, &m) != TUNDRA_DECODE_OK) return;
+    Pending *p = find_handle(m.u.agent_req.req_id);
+    if (!p) return;
+    p->used = 0;
+    if (p->requester != p->agent) server_response(p, AGENT_UNAVAILABLE, "The agent is away and its queue is full");
 }
 
 void agents_session_released(Session *s) {
@@ -213,8 +260,8 @@ void agents_session_released(Session *s) {
         Pending *p = &pending[i];
         if (!p->used) continue;
         if (p->agent == s && p->requester != s) {
-            server_response(p, AGENT_UNAVAILABLE, "The agent went away");
             p->used = 0;
+            server_response(p, AGENT_UNAVAILABLE, "The agent went away");
         } else if (p->requester == s) {
             p->used = 0;
         }

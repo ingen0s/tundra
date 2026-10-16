@@ -218,7 +218,7 @@ static int handle_frame(const uint8_t *frame, size_t plen) {
             TundraReader it = tundra_reader(m.u.list.entries.p, m.u.list.entries.len);
             TundraBytes name, caps;
             uint8_t online;
-            printf("AGENTS %u\n", m.u.list.count);
+            printf("AGENTS %u%s\n", m.u.list.count, m.u.list.truncated ? " truncated" : "");
             while (tundra_next_agent(&it, &name, &online, &caps)) {
                 printf("AGENTINFO %.*s %u %.*s\n", (int)name.len, (const char *)name.p, online, (int)caps.len,
                        (const char *)caps.p);
