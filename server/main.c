@@ -20,6 +20,7 @@ static void tick(void) {
         auth_reload();
     }
     sessions_expire();
+    agents_expire();
     time_t now = mono_s();
     if (now - last_ping >= PING_INTERVAL) {
         sessions_ping();
@@ -29,7 +30,8 @@ static void tick(void) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "usage: %s [-p port] [-d database] [-t tokens-file [-A]] [-i idle-timeout-s] [-g resume-grace-s] [-v]\n"
+            "usage: %s [-p port] [-d database] [-t tokens-file [-A]] [-i idle-timeout-s] [-g resume-grace-s]\n"
+            "          [-T agent-timeout-s] [-v]\n"
             "  -d  keep messages in this SQLite database (history survives restarts)\n"
             "  -t  \"username token\" file: listed names must present their token (re-read on SIGHUP)\n"
             "  -A  with -t, every username must be listed\n",
@@ -41,7 +43,7 @@ int main(int argc, char **argv) {
     const char *db_path = NULL;
     const char *tokens_path = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "p:d:t:Ai:g:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "p:d:t:Ai:g:T:vh")) != -1) {
         switch (opt) {
             case 'd': db_path = optarg; break;
             case 't': tokens_path = optarg; break;
@@ -49,11 +51,12 @@ int main(int argc, char **argv) {
             case 'p': port = atoi(optarg); break;
             case 'i': idle_timeout = atoi(optarg); break;
             case 'g': resume_grace = atoi(optarg); break;
+            case 'T': agent_timeout = atoi(optarg); break;
             case 'v': verbose = 1; break;
             default: usage(argv[0]); return opt == 'h' ? 0 : 1;
         }
     }
-    if (port <= 0 || port > 65535 || idle_timeout <= 0 || resume_grace < 0) {
+    if (port <= 0 || port > 65535 || idle_timeout <= 0 || resume_grace < 0 || agent_timeout <= 0) {
         usage(argv[0]);
         return 1;
     }
@@ -76,7 +79,10 @@ int main(int argc, char **argv) {
     net_run(tick);
 
     net_shutdown();
-    for (int i = 0; i < MAX_SESSIONS; i++) backlog_clear(&sessions[i]);
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        backlog_clear(&sessions[i]);
+        free(sessions[i].capabilities);
+    }
     msglog_free();
     store_close();
     auth_free();

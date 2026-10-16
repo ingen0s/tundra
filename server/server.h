@@ -24,6 +24,10 @@
 #define MAX_OUTBOUND_BYTES    (1u << 20)   /* per client; slower clients are disconnected */
 #define REPLAY_HIGH_WATER     (256u << 10) /* backlog replay pauses while this much is queued */
 #define MAX_READS_PER_EVENT   16           /* fairness: other clients get a turn */
+#define MAX_PENDING_REQUESTS  4096         /* open agent requests, server-wide */
+#define MAX_PENDING_PER_SESSION 64         /* open agent requests per requester */
+#define MAX_PENDING_PER_AGENT 256          /* open agent requests per agent */
+#define DEFAULT_AGENT_TIMEOUT 60           /* seconds an agent request may stay open */
 #define MSGLOG_CAPACITY       10000     /* recent messages kept in memory for history */
 #define MSGLOG_MAX_BYTES      (64u << 20) /* and at most this much message text */
 
@@ -67,6 +71,9 @@ typedef struct Session {
     uint32_t messages_received;
     uint8_t auth_token[256];    /* token presented at registration, for re-checks */
     size_t auth_token_len;
+    int is_agent;
+    uint8_t *capabilities;      /* as advertised; opaque to the server */
+    size_t capabilities_len;
 } Session;
 
 typedef struct Client {
@@ -214,6 +221,18 @@ uint64_t store_next_id(void);      /* first id to use after loading, 0 without a
 /* Room history before `before_id` (0 = latest), newest first. Fills `out`
  * with up to `limit` messages whose text the caller must free. */
 size_t store_history(const char *room, uint64_t before_id, size_t limit, LoggedMessage *out);
+
+/* ---- agents.c ---- */
+extern int agent_timeout;
+void handle_agent_advertise(Client *c, uint16_t seq, TundraBytes caps);
+void handle_agent_request(Client *c, uint16_t seq, const TundraMsg *m);
+void handle_agent_response(Client *c, uint16_t seq, const TundraMsg *m);
+void handle_list_agents(Client *c, uint16_t seq);
+void agents_expire(void);
+/* Closes requests to and from `s`, and forgets its capabilities. */
+void agents_session_released(Session *s);
+/* An AGENT_REQUEST_IN frame was dropped from a backlog: closes its request. */
+void agents_request_dropped(const uint8_t *payload, size_t len);
 
 /* ---- handlers.c ---- */
 void handle_frame(Client *c, const uint8_t *frame, size_t payload_len);

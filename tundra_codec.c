@@ -58,6 +58,14 @@ int tundra_next_who(TundraReader *it, TundraBytes *user, uint8_t *online) {
     return it->ok;
 }
 
+int tundra_next_agent(TundraReader *it, TundraBytes *name, uint8_t *online, TundraBytes *capabilities) {
+    if (it->pos >= it->len) return 0;
+    *name = rd_str8(it);
+    *online = tundra_rd_u8(it);
+    *capabilities = rd_str16(it);
+    return it->ok;
+}
+
 int tundra_next_history(TundraReader *it, TundraMsg *chat) {
     if (it->pos >= it->len) return 0;
     uint16_t n = tundra_rd_u16(it);
@@ -114,6 +122,11 @@ static void read_list(TundraReader *r, uint8_t type, uint16_t count, TundraBytes
                 (void)rd_str8(r);
                 (void)tundra_rd_u8(r);
                 break;
+            case MSG_AGENT_LIST:
+                (void)rd_str8(r);
+                (void)tundra_rd_u8(r);
+                (void)rd_str16(r);
+                break;
             case MSG_HISTORY_RESULT: {
                 uint16_t n = tundra_rd_u16(r);
                 const uint8_t *p = tundra_rd_bytes(r, n);
@@ -169,6 +182,31 @@ int tundra_decode(uint8_t type, const uint8_t *payload, size_t len, TundraMsg *o
         case MSG_ROOM_LIST:
             out->u.list.count = tundra_rd_u16(&r);
             read_list(&r, type, out->u.list.count, &out->u.list.entries);
+            break;
+        case MSG_AGENT_LIST:
+            out->u.list.truncated = tundra_rd_u8(&r);
+            if (out->u.list.truncated > 1) r.ok = 0;
+            out->u.list.count = tundra_rd_u16(&r);
+            read_list(&r, type, out->u.list.count, &out->u.list.entries);
+            break;
+        case MSG_AGENT_ADVERTISE:
+            out->u.advertise.capabilities = rd_str16(&r);
+            break;
+        case MSG_AGENT_REQUEST:
+        case MSG_AGENT_REQUEST_IN:
+            out->u.agent_req.peer = rd_str8(&r);
+            out->u.agent_req.req_id = tundra_rd_u64(&r);
+            out->u.agent_req.body = rd_str16(&r);
+            break;
+        case MSG_AGENT_RESPONSE:
+        case MSG_AGENT_RESPONSE_IN:
+            out->u.agent_resp.peer = rd_str8(&r);
+            out->u.agent_resp.req_id = tundra_rd_u64(&r);
+            out->u.agent_resp.status = tundra_rd_u8(&r);
+            out->u.agent_resp.final = tundra_rd_u8(&r);
+            out->u.agent_resp.body = rd_str16(&r);
+            break;
+        case MSG_LIST_AGENTS:
             break;
         case MSG_WHO_RESULT:
         case MSG_HISTORY_RESULT:
@@ -251,6 +289,12 @@ void tundra_wr_room_entry(TundraWriter *w, TundraBytes room, uint16_t members) {
     tundra_wr_u16(w, members);
 }
 
+void tundra_wr_agent_entry(TundraWriter *w, TundraBytes name, uint8_t online, TundraBytes capabilities) {
+    wr_str8(w, name);
+    tundra_wr_u8(w, online);
+    wr_str16(w, capabilities);
+}
+
 void tundra_wr_who_entry(TundraWriter *w, TundraBytes user, uint8_t online) {
     wr_str8(w, user);
     tundra_wr_u8(w, online);
@@ -303,6 +347,31 @@ long tundra_encode(const TundraMsg *m, uint8_t *buf, size_t cap) {
         case MSG_ROOM_LIST:
             tundra_wr_u16(&w, m->u.list.count);
             tundra_wr_bytes(&w, m->u.list.entries.p, m->u.list.entries.len);
+            break;
+        case MSG_AGENT_LIST:
+            if (m->u.list.truncated > 1) w.ok = 0;
+            tundra_wr_u8(&w, m->u.list.truncated);
+            tundra_wr_u16(&w, m->u.list.count);
+            tundra_wr_bytes(&w, m->u.list.entries.p, m->u.list.entries.len);
+            break;
+        case MSG_AGENT_ADVERTISE:
+            wr_str16(&w, m->u.advertise.capabilities);
+            break;
+        case MSG_AGENT_REQUEST:
+        case MSG_AGENT_REQUEST_IN:
+            wr_str8(&w, m->u.agent_req.peer);
+            tundra_wr_u64(&w, m->u.agent_req.req_id);
+            wr_str16(&w, m->u.agent_req.body);
+            break;
+        case MSG_AGENT_RESPONSE:
+        case MSG_AGENT_RESPONSE_IN:
+            wr_str8(&w, m->u.agent_resp.peer);
+            tundra_wr_u64(&w, m->u.agent_resp.req_id);
+            tundra_wr_u8(&w, m->u.agent_resp.status);
+            tundra_wr_u8(&w, m->u.agent_resp.final);
+            wr_str16(&w, m->u.agent_resp.body);
+            break;
+        case MSG_LIST_AGENTS:
             break;
         case MSG_WHO_RESULT:
         case MSG_HISTORY_RESULT:
@@ -387,6 +456,13 @@ const char *tundra_type_name(uint8_t type) {
         case MSG_ROOM_EVENT:        return "ROOM_EVENT";
         case MSG_HISTORY_RESULT:    return "HISTORY_RESULT";
         case MSG_WHO_RESULT:        return "WHO_RESULT";
+        case MSG_AGENT_ADVERTISE:   return "AGENT_ADVERTISE";
+        case MSG_AGENT_REQUEST:     return "AGENT_REQUEST";
+        case MSG_AGENT_RESPONSE:    return "AGENT_RESPONSE";
+        case MSG_LIST_AGENTS:       return "LIST_AGENTS";
+        case MSG_AGENT_LIST:        return "AGENT_LIST";
+        case MSG_AGENT_REQUEST_IN:  return "AGENT_REQUEST_IN";
+        case MSG_AGENT_RESPONSE_IN: return "AGENT_RESPONSE_IN";
         default:                    return "UNKNOWN";
     }
 }

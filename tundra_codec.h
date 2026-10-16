@@ -60,7 +60,20 @@ typedef struct {
         /* List messages: `entries` holds `count` encoded entries, read them
          * with the matching tundra_next_* iterator below. Decoding has
          * already validated every entry. ROOM_LIST leaves `room` empty. */
-        struct { TundraBytes room; uint16_t count; TundraBytes entries; } list;     /* ROOM_LIST, HISTORY_RESULT, WHO_RESULT */
+        /* AGENT_LIST also carries `truncated`: 1 when more agents exist
+         * than fit in one frame. */
+        struct { TundraBytes room; uint8_t truncated; uint16_t count; TundraBytes entries; } list; /* ROOM_LIST, HISTORY_RESULT, WHO_RESULT, AGENT_LIST */
+        struct { TundraBytes capabilities; } advertise;                             /* AGENT_ADVERTISE */
+        /* AGENT_REQUEST: peer = agent. AGENT_REQUEST_IN: peer = requester. */
+        struct { TundraBytes peer; uint64_t req_id; TundraBytes body; } agent_req;
+        /* AGENT_RESPONSE: peer = requester. AGENT_RESPONSE_IN: peer = agent. */
+        struct {
+            TundraBytes peer;
+            uint64_t req_id;
+            uint8_t status;
+            uint8_t final;
+            TundraBytes body;
+        } agent_resp;
     } u;
 } TundraMsg;
 
@@ -70,6 +83,7 @@ typedef struct {
 int tundra_next_room(TundraReader *it, TundraBytes *room, uint16_t *members);
 int tundra_next_who(TundraReader *it, TundraBytes *user, uint8_t *online);
 int tundra_next_history(TundraReader *it, TundraMsg *chat); /* fills a MSG_CHAT */
+int tundra_next_agent(TundraReader *it, TundraBytes *name, uint8_t *online, TundraBytes *capabilities);
 
 /* REGISTER extensions. tundra_reg_find returns 1 and sets `value` when
  * `tag` is present (first occurrence). tundra_wr_tlv appends one TLV. */
@@ -80,6 +94,7 @@ void tundra_wr_tlv(TundraWriter *w, uint8_t tag, const void *value, size_t len);
 void tundra_wr_room_entry(TundraWriter *w, TundraBytes room, uint16_t members);
 void tundra_wr_who_entry(TundraWriter *w, TundraBytes user, uint8_t online);
 void tundra_wr_history_entry(TundraWriter *w, const TundraMsg *chat);
+void tundra_wr_agent_entry(TundraWriter *w, TundraBytes name, uint8_t online, TundraBytes capabilities);
 
 /* Decodes `len` payload bytes of message `type` into `out`.
  * Returns TUNDRA_DECODE_OK, _MALFORMED or _UNKNOWN. */

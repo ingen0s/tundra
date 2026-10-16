@@ -39,6 +39,8 @@ Text is UTF-8 by convention; the server does not inspect it. Chat text is limite
 
 ## Client to server
 
+Client message types are 0x01-0x0F and 0x20-0x2F; server message types are 0x10-0x1F and 0x30-0x3F.
+
 | Type | Code | Payload |
 |------|------|---------|
 | `REGISTER` | 0x01 | `id16 id` `str8 username`, then optional extensions (see below). Must be sent within 10 seconds of connecting. |
@@ -53,6 +55,10 @@ Text is UTF-8 by convention; the server does not inspect it. Chat text is limite
 | `ACK` | 0x0A | `u64 id`: every `CHAT` up to and including `id` has been processed. Cumulative; optional. |
 | `HISTORY` | 0x0B | `str8 room` `u64 before_id` `u16 limit`. `before_id` 0 means "latest". `limit` 0 or over 100 means 100. |
 | `WHO` | 0x0C | `str8 room` |
+| `AGENT_ADVERTISE` | 0x20 | `str16 capabilities` (opaque, usually JSON, up to 8 KiB). Empty stops being an agent. |
+| `AGENT_REQUEST` | 0x21 | `str8 agent` `u64 req_id` `str16 body`. `req_id` is chosen by the requester. |
+| `AGENT_RESPONSE` | 0x22 | `str8 requester` `u64 handle` `u8 status` `u8 final` `str16 body`. `handle` is the one from `AGENT_REQUEST_IN`. |
+| `LIST_AGENTS` | 0x23 | empty |
 
 ## Server to client
 
@@ -69,6 +75,9 @@ Text is UTF-8 by convention; the server does not inspect it. Chat text is limite
 | `ROOM_EVENT` | 0x1A | `u8 event` `str8 room` `str8 user`. Event 1 = joined, 2 = left. |
 | `HISTORY_RESULT` | 0x1B | `str8 room` `u16 count`, then `count` x (`u16 len` + a `CHAT` payload), oldest first |
 | `WHO_RESULT` | 0x1C | `str8 room` `u16 count`, then `count` x (`str8 user` `u8 online`) |
+| `AGENT_LIST` | 0x30 | `u8 truncated` `u16 count`, then `count` x (`str8 name` `u8 online` `str16 capabilities`). `truncated` is 1 when more agents exist than fit in one frame. |
+| `AGENT_REQUEST_IN` | 0x31 | `str8 requester` `u64 handle` `str16 body`. `handle` is assigned by the server. |
+| `AGENT_RESPONSE_IN` | 0x32 | `str8 agent` `u64 req_id` `u8 status` `u8 final` `str16 body` |
 
 `BROADCAST_MESSAGE` (0x11) and `IMAGE` (0x13) are reserved and not sent.
 
@@ -122,6 +131,28 @@ All catch-up is paced: it is sent only while the connection has less than 256 Ki
 - `JOIN` for a room you are already in gets `INVALID_FORMAT` ("Already in that room").
 - The server keeps the most recent 10,000 messages (and at most 64 MiB of text) in memory. When it runs with a database (`-d`), room and direct messages are also written there, `HISTORY` reads from the database (so it can page back indefinitely), and the recent log survives restarts. Message ids are reserved in the database in blocks of 1,000 before use, so after a restart they keep increasing (possibly skipping some) and an id is never reused, even if an insert failed. A failed insert is logged; the message is still delivered.
 
+## Agents
+
+Agents are ordinary sessions that advertise capabilities. The server routes typed requests to them and their responses back, without interpreting either body.
+
+1. An agent sends `AGENT_ADVERTISE`. `LIST_AGENTS` shows every advertised agent, whether it is online, and its capabilities.
+2. A client sends `AGENT_REQUEST` with a request id of its choosing. The agent receives `AGENT_REQUEST_IN` naming the requester and carrying a server-assigned **handle**. Handles are never reused, so an answer to a request that has already been closed can never be mistaken for an answer to a newer one, even if the requester reuses its id. If the agent is briefly disconnected, the request waits in its backlog; if the backlog overflows and drops it, the requester gets `UNAVAILABLE` right away.
+3. The agent answers with `AGENT_RESPONSE` giving the requester and the handle. It may send any number of partial responses (`final` = 0) followed by one final response (`final` = 1). The requester receives each as `AGENT_RESPONSE_IN` with its own request id.
+4. The server only accepts a response whose handle belongs to an open request sent to that agent, so agents cannot answer requests they were not given or that have already closed.
+5. An agent that sends an empty `AGENT_ADVERTISE` stops being an agent; its open requests are closed with `UNAVAILABLE`.
+
+| Status | Name | Sent by |
+|--------|------|---------|
+| 0 | `OK` | agent |
+| 1 | `ERROR` | agent |
+| 2 | `REJECTED` | agent |
+| 3 | `TIMEOUT` | server, when no response arrives for 60 seconds (`-T`); each partial response restarts the clock |
+| 4 | `UNAVAILABLE` | server, when the agent's session ends, it stops advertising, or the request is dropped from its full backlog |
+
+Limits: a requester may have 64 open requests, an agent 256, and the server 4,096; a request id may not be reused while its request is open.
+
+`AGENT_COMMAND` (0x03) is the older, untyped form: it broadcasts `"<agent> <command>"` to `#lobby` as `BROADCAST_AGENT` and is kept for compatibility.
+
 ## Direct messages
 
 `SEND` with kind 1 delivers to one user, online or within their hold period. The sender gets `SENT`; the recipient gets a `CHAT` whose target is their own username. A direct message to yourself is accepted and stored (you get `SENT`) but not echoed back.
@@ -139,3 +170,5 @@ All catch-up is paced: it is sent only while the connection has less than 256 Ki
 | 0x0007 | `NOT_A_MEMBER` | send, history or leave without membership |
 | 0x0008 | `INVALID_NAME` | bad username or room name |
 | 0x0009 | `UNAUTHORIZED` | missing or wrong token for this username; the connection is closed |
+| 0x000A | `NOT_AN_AGENT` | request to a user who has not advertised as an agent |
+| 0x000B | `BAD_REQUEST` | request id already open, too many open requests, or a response to no open request |

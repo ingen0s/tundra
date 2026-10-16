@@ -164,7 +164,7 @@ expect "events buffered while away are delivered" "$TMP/iris2.out" "EVENT joined
 
 # 8b. ACKs and resume points
 raw >"$TMP/ack.out" <<'PY'
-import sys, struct
+import sys, struct, time
 from tundra_raw import *
 port = int(sys.argv[1])
 
@@ -217,6 +217,7 @@ qsid = q.wait_for(0x10)[1][:16]
 talker.send(frame(0x02, s16(b"before")))
 q.wait_for(0x17)
 q.sock.close()
+time.sleep(0.3)  # let the server see the disconnect; bytes written to a dying socket count as written
 talker.send(frame(0x02, s16(b"after")))
 talker.wait_for(0x18)
 q = Conn(port)
@@ -718,6 +719,199 @@ start_server store3 "$PORT" -d "$TMP/chat.db"
 client -u jay -j "#gone" -y "#gone" -w 0.3 >"$TMP/store3.out"
 expect "a deleted room stays empty after a restart" "$TMP/store3.out" "HISTORY #gone 0"
 stop_server store3
+
+# 22. typed agent messaging
+PORT=$((BASE_PORT + 5))
+start_server agents "$PORT" -T 1
+client -u echo1 -G '{"skills":["echo"]}' -E -w 4 >"$TMP/echo1.out" &
+ECHO1=$!
+client -u streamer -G '{"skills":["stream"]}' -E -S -w 4 >"$TMP/streamer.out" &
+STREAMER=$!
+client -u silent -G '{"skills":["nothing"]}' -w 4 >"$TMP/silent.out" &
+SILENT=$!
+client -u plainuser -w 4 >/dev/null &
+PLAIN=$!
+wait_line "$TMP/echo1.out" "SYSTEM Welcome, echo1!"
+wait_line "$TMP/streamer.out" "SYSTEM Welcome, streamer!"
+wait_line "$TMP/silent.out" "SYSTEM Welcome, silent!"
+sleep 0.2
+client -u asker -Q -q "echo1:hello agent" -q "streamer:go" -q "plainuser:hi" -q "ghost:hi" -w 0.6 >"$TMP/asker.out"
+expect "agent list shows advertised agents" "$TMP/asker.out" 'AGENTINFO echo1 1 {"skills":["echo"]}'
+expect_not "agent list leaves out plain users" "$TMP/asker.out" "AGENTINFO plainuser"
+expect "agent receives the request" "$TMP/echo1.out" "AREQ asker 1 hello agent"
+expect "requester receives the response" "$TMP/asker.out" "ARESP echo1 1 0 1 echo: hello agent"
+expect "streamed partial response" "$TMP/asker.out" "ARESP streamer 2 0 0 working"
+expect "streamed final response" "$TMP/asker.out" "ARESP streamer 2 0 1 echo: go"
+expect "request to a non-agent is refused" "$TMP/asker.out" "ERROR 10 "
+expect "request to an unknown agent is refused" "$TMP/asker.out" "ERROR 6 No such agent"
+
+raw >"$TMP/agentraw.out" <<'PY'
+import sys, struct, time
+from tundra_raw import *
+port = int(sys.argv[1])
+def req(agent, rid, body):
+    return frame(0x21, s8(agent) + struct.pack(">Q", rid) + s16(body))
+def resp(to, rid, status, final, body):
+    return frame(0x22, s8(to) + struct.pack(">QBB", rid, status, final) + s16(body))
+
+a = Conn(port)
+a.send(register(b"rawasker"))
+a.wait_for(0x10)
+a.send(req(b"silent", 7, b"first"))
+a.send(req(b"silent", 7, b"again"))
+f = a.wait_for(0x15)
+print("duplicate-id", error_code(f[1]) if f else None)
+
+m = Conn(port)
+m.send(register(b"meddler"))
+m.wait_for(0x10)
+m.send(resp(b"rawasker", 7, 0, 1, b"spoofed"))
+f = m.wait_for(0x15)
+print("spoofed-response", error_code(f[1]) if f else None)
+
+f = a.wait_for(0x32, 4)
+if f:
+    p = f[1]
+    nl = p[0]; rid, status, final = struct.unpack(">QBB", p[1 + nl:11 + nl])
+    print("timeout", p[1:1 + nl].decode(), rid, status, final)
+else:
+    print("timeout none")
+
+a.send(frame(0x20, s16(b"x" * 8193)))
+f = a.wait_for(0x15)
+print("caps-too-large", error_code(f[1]) if f else None)
+PY
+expect "duplicate request id refused" "$TMP/agentraw.out" "duplicate-id 11"
+expect "response to someone else's request refused" "$TMP/agentraw.out" "spoofed-response 11"
+expect "unanswered request times out" "$TMP/agentraw.out" "timeout silent 7 3 1"
+expect "oversized capabilities refused" "$TMP/agentraw.out" "caps-too-large 2"
+wait $ECHO1 $STREAMER $SILENT $PLAIN
+stop_server agents
+
+# 23. requests to an agent that goes away are closed
+PORT=$((BASE_PORT + 6))
+start_server agents2 "$PORT" -g 1
+client -u flaky -G '{}' -w 0.3 >"$TMP/flaky.out"
+client -u waiter -q "flaky:are you there" -w 4 >"$TMP/waiter.out"
+expect "request to a vanished agent gets unavailable" "$TMP/waiter.out" "ARESP flaky 1 4 1 "
+stop_server agents2
+
+# 23b. agent edge cases from review
+PORT=$((BASE_PORT + 9))
+start_server agents3 "$PORT" -T 2
+raw >"$TMP/agentedge.out" <<'PY'
+import sys, struct, time
+from tundra_raw import *
+port = int(sys.argv[1])
+
+def req(agent, rid, body):
+    return frame(0x21, s8(agent) + struct.pack(">Q", rid) + s16(body))
+def resp(to, handle, status, final, body):
+    return frame(0x22, s8(to) + struct.pack(">QBB", handle, status, final) + s16(body))
+def parse_req_in(p):
+    n = p[0]; who = p[1:1 + n]; handle = struct.unpack(">Q", p[1 + n:9 + n])[0]
+    return who.decode(), handle, p[11 + n:].decode()
+def parse_resp_in(p):
+    n = p[0]; rid, status, final = struct.unpack(">QBB", p[1 + n:11 + n])
+    return rid, status, final, p[13 + n:].decode()
+
+# 1. a late answer to a timed-out request must not answer a newer request with the same id
+ag = Conn(port)
+ag.send(register(b"lateagent"))
+sid = ag.wait_for(0x10)[1][:16]
+ag.send(frame(0x20, s16(b"{}")))
+time.sleep(0.2)
+ag.sock.close()
+rq = Conn(port, timeout=4)
+rq.send(register(b"latereq"))
+rq.wait_for(0x10)
+rq.send(req(b"lateagent", 5, b"first"))
+f = rq.wait_for(0x32, 4)
+print("first-timeout", parse_resp_in(f[1])[:3] if f else None)
+rq.send(req(b"lateagent", 5, b"second"))
+ag = Conn(port)
+ag.send(register(b"lateagent", sid))
+ag.wait_for(0x10)
+got = {}
+for _ in range(2):
+    f = ag.wait_for(0x31)
+    if f:
+        who, handle, body = parse_req_in(f[1])
+        got[body] = handle
+print("agent-sees-distinct-handles", len(got) == 2 and got.get("first") != got.get("second"))
+ag.send(resp(b"latereq", got.get("first", 0), 0, 1, b"late answer"))
+f = ag.wait_for(0x15)
+print("late-answer-refused", error_code(f[1]) if f else None)
+ag.send(resp(b"latereq", got.get("second", 0), 0, 1, b"right answer"))
+f = rq.wait_for(0x32)
+print("right-answer", parse_resp_in(f[1]) if f else None)
+
+# 2. requests dropped from a detached agent's full backlog fail at once
+ag2 = Conn(port)
+ag2.send(register(b"busyagent"))
+ag2.wait_for(0x10)
+ag2.send(frame(0x20, s16(b"{}")))
+time.sleep(0.2)
+ag2.sock.close()
+time.sleep(0.2)
+askers = []
+for i in range(2):
+    a = Conn(port)
+    a.send(register(b"asker%d" % i))
+    a.wait_for(0x10)
+    askers.append(a)
+start = time.time()
+for i in range(30):
+    for a in askers:
+        a.send(req(b"busyagent", i, b"x"))
+# count only what arrives in the first 1.2 s, well before the 2 s timeout
+unavailable = 0
+while time.time() - start < 1.2:
+    for a in askers:
+        a.sock.settimeout(0.05)
+        f = a.recv_frame()
+        if f and f[0] == 0x32 and parse_resp_in(f[1])[1] == 4:
+            unavailable += 1
+print("dropped-requests-fail-fast", unavailable >= 10, unavailable)
+
+# 3. turning off advertising closes open requests
+ag3 = Conn(port)
+ag3.send(register(b"quitter"))
+ag3.wait_for(0x10)
+ag3.send(frame(0x20, s16(b"{}")))
+r3 = Conn(port)
+r3.send(register(b"quitreq"))
+r3.wait_for(0x10)
+time.sleep(0.1)
+r3.send(req(b"quitter", 1, b"anyone?"))
+ag3.wait_for(0x31)
+ag3.send(frame(0x20, s16(b"")))
+f = r3.wait_for(0x32)
+print("unadvertise-closes", parse_resp_in(f[1])[:3] if f else None)
+
+# 4. an agent list that does not fit is marked truncated
+for i in range(10):
+    c = Conn(port)
+    c.send(register(b"bigcaps%d" % i))
+    c.wait_for(0x10)
+    c.send(frame(0x20, s16(b"c" * 8192)))
+    c.sock.close()
+time.sleep(0.2)
+l = Conn(port)
+l.send(register(b"lister"))
+l.wait_for(0x10)
+l.send(frame(0x23))
+f = l.wait_for(0x30)
+print("list-truncated", f[1][0] if f else None, struct.unpack(">H", f[1][1:3])[0] if f else None)
+PY
+expect "late answer: first request times out" "$TMP/agentedge.out" "first-timeout (5, 3, 1)"
+expect "late answer: agent sees distinct handles" "$TMP/agentedge.out" "agent-sees-distinct-handles True"
+expect "late answer to a closed request is refused" "$TMP/agentedge.out" "late-answer-refused 11"
+expect "answer to the new request reaches the requester" "$TMP/agentedge.out" "right-answer (5, 0, 1, 'right answer')"
+expect "requests dropped from a full backlog fail fast" "$TMP/agentedge.out" "dropped-requests-fail-fast True"
+expect "turning off advertising closes open requests" "$TMP/agentedge.out" "unadvertise-closes (1, 4, 1)"
+expect "an oversized agent list is marked truncated" "$TMP/agentedge.out" "list-truncated 1"
+stop_server agents3
 
 if [ "$FAILED" -ne 0 ]; then
     for log in "$TMP"/*.log; do echo "--- $(basename "$log") ---"; tail -40 "$log"; done
