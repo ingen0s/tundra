@@ -52,7 +52,7 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/src" -w /src -e VERSION alpine:3.20 sh -euc '
             apk add --no-cache build-base pkgconf python3 sqlite-dev sqlite-static openssl-dev openssl-libs-static linux-headers >/dev/null
-            make STATIC=1 CFLAGS=-O2 VERSION="$VERSION"
+            make STATIC=1 CFLAGS=-O2 VERSION="$VERSION" >build.log 2>&1 || { cat build.log; exit 1; }
             strip build/tundra_chat_server build/tundra_client
             chown -R '"$(id -u):$(id -g)"' build'
       - name: Check the binaries are static
@@ -70,6 +70,11 @@ jobs:
           mkdir -p "dist/$NAME"
           cp build/tundra_chat_server build/tundra_client README.md LICENSE "dist/$NAME/"
           tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+      - name: Show build errors
+        if: failure()
+        shell: bash
+        run: |
+          [ -f build.log ] && grep -iE "error|undefined|cannot find|No such" build.log | head -25 | sed 's/^/::error title=build::/' || true
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.NAME }}
@@ -108,7 +113,7 @@ jobs:
         run: |
           for arch in arm64 x86_64; do
             PKG_CONFIG_PATH="$HOME/openssl/$arch/lib/pkgconfig" \
-              make BUILD="build-$arch" STATIC=1 CFLAGS=-O2 VERSION="$VERSION" CC="cc -arch $arch -mmacosx-version-min=11.0"
+              make BUILD="build-$arch" STATIC=1 CFLAGS=-O2 VERSION="$VERSION" CC="cc -arch $arch -mmacosx-version-min=11.0" >>build.log 2>&1 || { cat build.log; exit 1; }
           done
           mkdir -p build
           for bin in tundra_chat_server tundra_client codec_test; do
@@ -131,6 +136,11 @@ jobs:
           mkdir -p "dist/$NAME"
           cp build/tundra_chat_server build/tundra_client README.md LICENSE "dist/$NAME/"
           tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+      - name: Show build errors
+        if: failure()
+        shell: bash
+        run: |
+          [ -f build.log ] && grep -iE "error|undefined|cannot find|No such" build.log | head -25 | sed 's/^/::error title=build::/' || true
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.NAME }}
@@ -160,7 +170,7 @@ jobs:
             mingw-w64-ucrt-x86_64-python
       - name: Build static executables
         run: |
-          make STATIC=1 CFLAGS=-O2 VERSION="$VERSION"
+          make STATIC=1 CFLAGS=-O2 VERSION="$VERSION" >build.log 2>&1 || { cat build.log; exit 1; }
           strip build/tundra_chat_server.exe build/tundra_client.exe
       - name: Check the executables need only Windows DLLs
         run: |
@@ -179,6 +189,11 @@ jobs:
           mkdir -p "dist/$NAME"
           cp build/tundra_chat_server.exe build/tundra_client.exe README.md LICENSE "dist/$NAME/"
           cd dist && python -m zipfile -c "$NAME.zip" "$NAME"
+      - name: Show build errors
+        if: failure()
+        shell: bash
+        run: |
+          [ -f build.log ] && grep -iE "error|undefined|cannot find|No such" build.log | head -25 | sed 's/^/::error title=build::/' || true
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.NAME }}
