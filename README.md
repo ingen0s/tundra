@@ -36,7 +36,14 @@ On Linux and macOS, one line installs the latest release to `~/.local/bin` after
 curl -fsSL https://github.com/ingen0s/tundra/releases/latest/download/install.sh | sh
 ```
 
-Set `TUNDRA_VERSION=0.2.0` for a specific release or `PREFIX=/usr/local` for another location. On Windows, unzip and run `tundra_chat_server.exe -w 8080`, then open http://localhost:8080/. On macOS, a tarball downloaded with a browser is quarantined; clear that with `xattr -dr com.apple.quarantine tundra-*` (the install script is not affected). `tundra_chat_server -V` prints the version.
+For a specific release or another location, set the variables on `sh`, not on `curl`:
+
+```bash
+curl -fsSL https://github.com/ingen0s/tundra/releases/latest/download/install.sh | TUNDRA_VERSION=0.2.0 sh
+curl -fsSL https://github.com/ingen0s/tundra/releases/latest/download/install.sh | sudo PREFIX=/usr/local sh
+```
+
+On Windows, unzip and run `tundra_chat_server.exe -w 8080`, then open http://localhost:8080/. The executables are not code-signed, so SmartScreen may warn the first time (choose "More info", then "Run anyway"). On macOS, a tarball downloaded with a browser is quarantined; clear that with `xattr -dr com.apple.quarantine tundra-*` (the install script is not affected). `tundra_chat_server -V` prints the version. The test client verifies TLS certificates against the system store; set `SSL_CERT_FILE` to use a different CA bundle.
 
 ## Quick start
 

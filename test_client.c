@@ -470,7 +470,13 @@ int main(int argc, char **argv) {
         if (insecure) {
             SSL_CTX_set_verify(tls_ctx, SSL_VERIFY_NONE, NULL);
         } else {
+            /* SSL_CERT_FILE / SSL_CERT_DIR override the built-in locations */
             SSL_CTX_set_default_verify_paths(tls_ctx);
+#if defined(_WIN32) && OPENSSL_VERSION_NUMBER >= 0x30200000L
+            /* the Windows certificate store: a static OpenSSL has no
+             * usable default CA path on a user's machine */
+            SSL_CTX_load_verify_store(tls_ctx, "org.openssl.winstore://");
+#endif
             SSL_CTX_set_verify(tls_ctx, SSL_VERIFY_PEER, NULL);
         }
         tls = SSL_new(tls_ctx);

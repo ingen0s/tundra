@@ -96,7 +96,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/openssl
-          key: openssl-${{ env.OPENSSL_VERSION }}-macos-universal-11.0
+          key: openssl-${{ env.OPENSSL_VERSION }}-macos-universal-11.0-etcssl
       - name: Build static OpenSSL for arm64 and x86_64
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
@@ -106,7 +106,7 @@ jobs:
           for arch in arm64 x86_64; do
             rm -rf src && mkdir src && tar -xzf "openssl-$OPENSSL_VERSION.tar.gz" -C src --strip-components 1
             (cd src && ./Configure "darwin64-$arch-cc" no-shared no-tests no-docs no-apps \
-                --prefix="$HOME/openssl/$arch" --libdir=lib -mmacosx-version-min=11.0 &&
+                --prefix="$HOME/openssl/$arch" --openssldir=/etc/ssl --libdir=lib -mmacosx-version-min=11.0 &&
              make -j"$(sysctl -n hw.ncpu)" build_libs >/dev/null && make install_dev >/dev/null)
           done
       - name: Build both architectures and merge them
@@ -126,6 +126,7 @@ jobs:
           lipo -archs build/tundra_chat_server | grep -q "x86_64 arm64"
           if otool -L build/tundra_chat_server | grep -qiE "ssl|crypto|homebrew"; then otool -L build/tundra_chat_server; exit 1; fi
           ./build/tundra_chat_server -V | grep -q "$VERSION (tls)"
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then arch -x86_64 ./build/tundra_chat_server -V; else echo "no Rosetta: x86_64 slice not run"; fi
       - name: Test
         run: |
           ./build/codec_test
@@ -218,4 +219,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp tools/install.sh dist/install.sh
-          gh release create "$GITHUB_REF_NAME" dist/* --title "Tundra ${{ needs.version.outputs.version }}" --generate-notes
+          pre=""
+          case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag $pre --title "Tundra ${{ needs.version.outputs.version }}" --generate-notes

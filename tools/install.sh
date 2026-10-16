@@ -9,6 +9,7 @@
 set -eu
 
 REPO="ingen0s/tundra"
+[ -n "${PREFIX:-}" ] || [ -n "${HOME:-}" ] || { echo "error: set PREFIX (HOME is not set)" >&2; exit 1; }
 PREFIX="${PREFIX:-$HOME/.local}"
 BIN="$PREFIX/bin"
 
@@ -48,7 +49,8 @@ name="tundra-$version-$platform"
 base="https://github.com/$REPO/releases/download/$tag"
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT INT TERM
+trap 'rm -rf "$tmp"' EXIT
+trap 'exit 130' INT TERM
 
 say "Downloading $name"
 fetch "$base/$name.tar.gz" "$tmp/$name.tar.gz" || die "download failed: $base/$name.tar.gz"
