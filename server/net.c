@@ -25,8 +25,34 @@ static void on_stop(void) {
 /* output                                                              */
 
 static void set_want_write(Client *c, int on) {
+    on = on || c->tls_wants_write;
     if (c->want_write == on || c->fd < 0) return;
     if (poller_set_write(poller, c->sock, c, on) == 0) c->want_write = on;
+}
+
+/* Socket I/O through TLS when the client has it. Both return >0 for bytes
+ * moved, -1 for "try again when the socket is ready", -2 for an error;
+ * client_recv also returns 0 when the peer closed. */
+static long client_send(Client *c, const void *buf, size_t len) {
+    if (c->ssl) return tls_send(c, buf, len);
+    for (;;) {
+        long n = plat_send(c->sock, buf, len);
+        if (n >= 0) return n;
+        if (plat_interrupted()) continue;
+        if (plat_would_block()) return -1;
+        log_debug("send failed on client %d: %s", c->fd, plat_socket_error());
+        return -2;
+    }
+}
+
+static long client_recv(Client *c, void *buf, size_t len) {
+    if (c->ssl) return tls_recv(c, buf, len);
+    for (;;) {
+        long n = plat_recv(c->sock, buf, len);
+        if (n >= 0) return n;
+        if (plat_interrupted()) continue;
+        return plat_would_block() ? -1 : -2;
+    }
 }
 
 /* Records that a CHAT frame ending at `end` in the output queue carries
@@ -58,11 +84,9 @@ static void advance_marks(Client *c, size_t sent) {
 static void flush_client(Client *c) {
     size_t off = 0;
     while (off < c->out_len && !c->dead) {
-        long n = plat_send(c->sock, c->out + off, c->out_len - off);
+        long n = client_send(c, c->out + off, c->out_len - off);
+        if (n == -1) break;
         if (n < 0) {
-            if (plat_interrupted()) continue;
-            if (plat_would_block()) break;
-            log_debug("send failed on client %d: %s", c->fd, plat_socket_error());
             mark_dead(c);
             return;
         }
@@ -196,6 +220,7 @@ void mark_dead(Client *c) {
 static void reap_client(Client *c) {
     if (c->fd >= 0) {
         poller_remove(poller, c->sock);
+        tls_detach(c);
         plat_close(c->sock);
         log_info("client %d closed", c->fd);
     }
@@ -252,18 +277,19 @@ static void read_client(Client *c) {
     for (int i = 0; i < MAX_READS_PER_EVENT && !c->dead && !c->close_after_flush; i++) {
         /* The buffer holds one maximum-size frame and complete frames are
          * consumed after every read, so there is always room here. */
-        long n = plat_recv(c->sock, c->in + c->in_len, sizeof(c->in) - c->in_len);
+        long n = client_recv(c, c->in + c->in_len, sizeof(c->in) - c->in_len);
         if (n > 0) {
             c->in_len += (size_t)n;
             process_input(c);
             continue;
         }
-        if (n == 0) {
-            mark_dead(c);
+        if (n != -1) {
+            mark_dead(c); /* closed or failed */
             return;
         }
-        if (plat_interrupted()) continue;
-        if (!plat_would_block()) mark_dead(c);
+        /* TLS may need the socket writable to make progress on a read
+         * (handshake or post-handshake messages) even with nothing queued */
+        if (c->ssl) set_want_write(c, c->out_len > 0);
         return;
     }
 }
@@ -286,13 +312,14 @@ static void accept_clients(tsock_t listener, int proto) {
         Client *c = alloc_client(s);
         if (!c) {
             log_info("no free client slots, rejecting a connection");
-            if (proto == PROTO_TCP) reject_full(s);
+            if (proto == PROTO_TCP && !tls_enabled()) reject_full(s); /* a plaintext error means nothing to a TLS client */
             else plat_close(s);
             continue;
         }
         c->proto = proto;
-        if (poller_add(poller, s, c) < 0) {
-            log_info("poller add failed: %s", plat_socket_error());
+        if (tls_attach(c) < 0 || poller_add(poller, s, c) < 0) {
+            log_info("cannot set up client %d", c->fd);
+            tls_detach(c);
             plat_close(s);
             c->fd = -1;
             c->sock = TSOCK_INVALID;
@@ -346,12 +373,29 @@ void net_handle_signals(void (*on_reload)(void)) {
     plat_handle_signals(on_stop, on_reload);
 }
 
+/* TLS can hold decrypted bytes that no socket event will announce: give
+ * those clients another read. Returns 1 if any still have more. */
+static int drain_tls_pending(void) {
+    int more = 0;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        Client *c = &clients[i];
+        if (c->fd < 0 || c->dead || c->close_after_flush || !tls_pending(c)) continue;
+        read_client(c);
+        if (!c->dead && c->out_len > 0) flush_client(c);
+        /* a client closing after its flush reads no more, so its leftover
+         * input must not keep the loop spinning */
+        if (!c->dead && !c->close_after_flush && tls_pending(c)) more = 1;
+    }
+    return more;
+}
+
 void net_run(void (*tick)(void)) {
     PollEvent events[MAX_EVENTS];
     time_t last_tick = mono_s();
+    int tls_more = 0;
 
     while (running) {
-        int n = poller_wait(poller, events, MAX_EVENTS, 1000);
+        int n = poller_wait(poller, events, MAX_EVENTS, tls_more ? 0 : 1000);
         if (n < 0) {
             log_info("%s wait failed: %s", poller_backend(), plat_socket_error());
             break;
@@ -368,10 +412,13 @@ void net_run(void (*tick)(void)) {
             }
             Client *c = events[i].ptr;
             if (c->fd < 0 || c->dead) continue;
-            if (events[i].readable) read_client(c);
-            if (!c->dead && events[i].writable) flush_client(c);
+            /* with TLS a read may need the socket writable (handshake, key
+             * updates), so a writable event also retries the read */
+            if (events[i].readable || (c->ssl && events[i].writable)) read_client(c);
+            if (!c->dead && (events[i].writable || (c->ssl && c->out_len > 0))) flush_client(c);
             if (!c->dead && events[i].error) mark_dead(c);
         }
+        tls_more = drain_tls_pending();
 
         time_t now = mono_s();
         if (now != last_tick) {

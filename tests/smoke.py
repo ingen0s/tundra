@@ -8,8 +8,10 @@ Windows) and that history survives a restart. Exits non-zero on failure.
 """
 import asyncio
 import os
+import shutil
 import signal
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -44,14 +46,14 @@ def free_port():
     return port
 
 
-def start(port, wsport, db):
+def start(port, wsport, db, extra=()):
     # log to a file: a pipe nobody reads fills up (about 4 KB on Windows)
     # and would block the server
     log = open(db + ".log", "w+b")
     kwargs = {"stderr": log}
     if WINDOWS:
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    proc = subprocess.Popen([SERVER, "-p", str(port), "-w", str(wsport), "-d", db], **kwargs)
+    proc = subprocess.Popen([SERVER, "-p", str(port), "-w", str(wsport), "-d", db, *extra], **kwargs)
     proc.log = log
     for _ in range(100):
         try:
@@ -101,6 +103,65 @@ async def sdk_checks(port):
     check("sdk: streamed agent answer", parts == ["working", "HELLO"])
     await client.close()
     await agent.close()
+
+
+def make_certs(tmp):
+    """A throwaway CA and a localhost certificate, or None without openssl."""
+    if not shutil.which("openssl"):
+        return None
+
+    def run(*args):
+        subprocess.run(["openssl", *args], cwd=tmp, check=True, capture_output=True)
+    with open(os.path.join(tmp, "ca.ext"), "w") as f:
+        f.write("basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n"
+                "subjectKeyIdentifier=hash\n")
+    with open(os.path.join(tmp, "leaf.ext"), "w") as f:
+        f.write("subjectAltName=DNS:localhost,IP:127.0.0.1\nkeyUsage=critical,digitalSignature,keyEncipherment\n"
+                "extendedKeyUsage=serverAuth\nauthorityKeyIdentifier=keyid\n")
+    run("req", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key", "-out", "ca.csr", "-subj", "/CN=Tundra smoke CA")
+    run("x509", "-req", "-in", "ca.csr", "-signkey", "ca.key", "-out", "ca.pem", "-days", "2", "-extfile", "ca.ext")
+    run("req", "-newkey", "rsa:2048", "-nodes", "-keyout", "tls.key", "-out", "tls.csr", "-subj", "/CN=localhost")
+    run("x509", "-req", "-in", "tls.csr", "-CA", "ca.pem", "-CAkey", "ca.key", "-CAcreateserial",
+        "-out", "tls.pem", "-days", "2", "-extfile", "leaf.ext")
+    return [os.path.join(tmp, n) for n in ("ca.pem", "tls.pem", "tls.key")]
+
+
+def tls_checks(tmp):
+    help_text = subprocess.run([SERVER, "-h"], capture_output=True, text=True)
+    if "-C  TLS" not in help_text.stdout + help_text.stderr:
+        print("skip - this build has no TLS")
+        return
+    certs = make_certs(tmp)
+    if not certs:
+        print("skip - no openssl command to make test certificates")
+        return
+    ca, cert, key = certs
+    port, wsport = free_port(), free_port()
+    proc = start(port, wsport, os.path.join(tmp, "tls.db"), ("-C", cert, "-K", key))
+    a = Conn(port, tls=True, cafile=ca)
+    a.send(register(b"tlsalice"))
+    check("tls: register with a verified certificate", a.wait_for(0x10) is not None)
+    b = Conn(port, tls=True, cafile=ca)
+    b.send(register(b"tlsbob"))
+    b.wait_for(0x10)
+    time.sleep(0.2)
+    a.send(frame(0x02, s16(b"y" * 60000)))
+    f = b.wait_for(0x17, 5.0)
+    check("tls: a 60 KB message", f is not None and len(chat_text(f[1])) == 60000)
+    w = WsConn(wsport, tls=True, cafile=ca)
+    check("tls: wss handshake", "101 Switching Protocols" in w.handshake)
+
+    async def sdk():
+        c = tundra.Client("localhost", port, "tlssdk", ssl=ssl.create_default_context(cafile=ca))
+        await c.connect()
+        mid = await c.send("#lobby", "sdk over tls")
+        await c.close()
+        return mid > 0
+    check("tls: Python SDK", asyncio.run(sdk()))
+    for c in (a, b, w):
+        c.sock.close()
+    code, err = stop(proc)
+    check("tls: clean shutdown", code == 0)
 
 
 def main():
@@ -241,6 +302,8 @@ def main():
     h.sock.close()
     code, err = stop(proc)
     check("clean shutdown after restart", code == 0)
+
+    tls_checks(tmp)
 
     print("%d/%d smoke checks passed" % (sum(results), len(results)))
     sys.exit(0 if all(results) else 1)

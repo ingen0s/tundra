@@ -86,6 +86,9 @@ enum { PROTO_TCP = 0, PROTO_HTTP, PROTO_WS };
 typedef struct Client {
     int fd;                     /* slot number for logs; -1 when the slot is free */
     tsock_t sock;
+    void *ssl;                  /* SSL* when the listener uses TLS */
+    int tls_wants_write;        /* OpenSSL needs the socket writable to continue */
+    int tls_failed;             /* fatal TLS error: skip close_notify */
     int proto;                  /* PROTO_*: raw Tundra, HTTP before upgrade, WebSocket */
     int dead;                   /* closed at the end of the current loop iteration */
     int close_after_flush;
@@ -251,6 +254,17 @@ void agents_expire(void);
 void agents_session_released(Session *s);
 /* An AGENT_REQUEST_IN frame was dropped from a backlog: closes its request. */
 void agents_request_dropped(const uint8_t *payload, size_t len);
+
+/* ---- tls.c ---- */
+int tls_available(void);                  /* built with OpenSSL */
+int tls_enabled(void);                    /* certificate loaded */
+int tls_init(const char *cert, const char *key);
+void tls_free(void);
+int tls_attach(Client *c);                /* on accept, when enabled */
+void tls_detach(Client *c);
+long tls_recv(Client *c, void *buf, size_t len); /* >0, 0 closed, -1 retry, -2 error */
+long tls_send(Client *c, const void *buf, size_t len); /* >0, -1 retry, -2 error */
+int tls_pending(const Client *c);         /* decrypted bytes waiting inside OpenSSL */
 
 /* ---- ws.c ---- */
 void ws_process_input(Client *c);          /* HTTP request or WebSocket frames */

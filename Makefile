@@ -3,6 +3,16 @@ CFLAGS  ?= -O2 -g
 # Required flags are appended with `override` so `make CFLAGS=...` cannot drop them.
 override CFLAGS += -std=c11 -Wall -Wextra -Wshadow -Wformat=2 -Werror $(SANFLAGS)
 SANITIZE := -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all
+# TLS: on when OpenSSL is found (pkg-config), off with TLS=0.
+TLS ?= auto
+ifeq ($(TLS),auto)
+  override TLS := $(shell pkg-config --exists openssl 2>/dev/null && echo 1 || echo 0)
+endif
+ifeq ($(TLS),1)
+  TLS_CFLAGS := -DTUNDRA_TLS $(shell pkg-config --cflags openssl 2>/dev/null)
+  TLS_LIBS   := $(or $(shell pkg-config --libs openssl 2>/dev/null),-lssl -lcrypto)
+endif
+
 # Per-platform settings. Windows builds use MinGW-w64 (MSYS2).
 ifeq ($(OS),Windows_NT)
   EXE      := .exe
@@ -37,10 +47,10 @@ $(BUILD)/web_index.h: web/index.html tools/embed.py | $(BUILD)
 	python3 tools/embed.py web/index.html $@ web_index_html
 
 $(SERVER): $(SERVER_SRC) server/server.h $(CODEC) $(PLATFORM) $(HEADERS) $(BUILD)/web_index.h | $(BUILD)
-	$(CC) $(CFLAGS) -I$(BUILD) -o $@ $(SERVER_SRC) $(CODEC) tundra_platform.c $(LDFLAGS) -lsqlite3 $(LDLIBS) $(NET_LIBS)
+	$(CC) $(CFLAGS) $(TLS_CFLAGS) -I$(BUILD) -o $@ $(SERVER_SRC) $(CODEC) tundra_platform.c $(LDFLAGS) -lsqlite3 $(TLS_LIBS) $(LDLIBS) $(NET_LIBS)
 
 $(CLIENT): test_client.c $(CODEC) $(PLATFORM) $(HEADERS) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ test_client.c $(CODEC) tundra_platform.c $(LDFLAGS) $(LDLIBS) $(NET_LIBS)
+	$(CC) $(CFLAGS) $(TLS_CFLAGS) -o $@ test_client.c $(CODEC) tundra_platform.c $(LDFLAGS) $(TLS_LIBS) $(LDLIBS) $(NET_LIBS)
 
 $(CODEC_T): tests/codec_test.c $(CODEC) $(HEADERS) | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/codec_test.c $(CODEC)

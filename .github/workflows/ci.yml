@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
       - name: Build
         run: |
           if [ "${{ matrix.build }}" = "asan" ]; then make asan; else make; fi
@@ -53,12 +53,24 @@ jobs:
           node-version: 22
       - name: Install dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+          sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
           cd tests/web && npm install
       - name: Build
         run: make
       - name: Web client in jsdom
         run: ./tests/web_ui.sh
+
+  no-tls:
+    # the build without OpenSSL still works and refuses -C/-K clearly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      - name: Build without TLS
+        run: make TLS=0
+      - name: Integration tests (TLS section skipped)
+        run: ./tests/integration.sh
 
   linux-poll:
     # the portable poll() backend that Windows uses, exercised on Linux
@@ -66,7 +78,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
       - name: Build with the poll() backend and sanitizers
         run: make all CFLAGS="-O1 -g -DTUNDRA_POLLER_POLL" SANFLAGS="-fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all"
       - name: Integration tests
@@ -78,8 +90,10 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: brew install openssl@3 pkg-config
       - name: Build
-        run: make
+        run: PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig" make
       - name: Codec unit tests
         run: ./build/codec_test
       - name: Integration tests
@@ -103,8 +117,12 @@ jobs:
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-sqlite3
             mingw-w64-x86_64-python
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-pkgconf
       - name: Build
         run: make
+      - name: Check TLS is built in
+        run: ./build/tundra_chat_server.exe -h 2>&1 | grep -- "-C  TLS"
       - name: Codec unit tests
         run: ./build/codec_test.exe
       - name: Smoke test

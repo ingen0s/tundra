@@ -137,8 +137,11 @@ def _read_chat(r):
 
 
 class Client:
-    def __init__(self, host="127.0.0.1", port=4242, username="", token=None, reconnect=True):
+    def __init__(self, host="127.0.0.1", port=4242, username="", token=None, reconnect=True, ssl=None):
+        """`ssl`: None for plain TCP, True for TLS verified against the system
+        CAs, or an ssl.SSLContext (for example one that trusts a private CA)."""
         self.host, self.port, self.username, self.token = host, port, username, token
+        self.ssl = ssl
         self.reconnect = reconnect
         self.session_id = None
         self.last_id = 0
@@ -166,6 +169,15 @@ class Client:
             ext += bytes([REG_TOKEN]) + struct.pack(">H", len(tok)) + tok
         return (self.session_id or bytes(16)) + _s8(self.username) + ext
 
+    async def _open(self):
+        if self.ssl:
+            ctx = self.ssl
+            if ctx is True:
+                import ssl as _ssl
+                ctx = _ssl.create_default_context()
+            return await asyncio.open_connection(self.host, self.port, ssl=ctx, server_hostname=self.host)
+        return await asyncio.open_connection(self.host, self.port)
+
     def _drop_writer(self):
         if self._writer is not None:
             self._writer.close()
@@ -175,7 +187,7 @@ class Client:
         """Connects and registers (or resumes). Raises TundraError on refusal;
         a refused client does not keep reconnecting in the background."""
         self._closing = False
-        self._reader, self._writer = await asyncio.open_connection(self.host, self.port)
+        self._reader, self._writer = await self._open()
         fut = self._send(REGISTER, self._register_payload(), expect_reply=True)
         if self._task is None or self._task.done():
             self._task = asyncio.ensure_future(self._read_loop())
@@ -253,7 +265,7 @@ class Client:
         while not self._closing:
             await asyncio.sleep(delay)
             try:
-                self._reader, self._writer = await asyncio.open_connection(self.host, self.port)
+                self._reader, self._writer = await self._open()
             except OSError:
                 delay = min(delay * 2, 5)
                 continue
@@ -436,8 +448,9 @@ class Agent(Client):
     handler. The handler gets an AgentRequest and either returns the answer
     or is an async generator yielding partial answers (the last one is final)."""
 
-    def __init__(self, host="127.0.0.1", port=4242, username="", capabilities=None, token=None, reconnect=True):
-        super().__init__(host, port, username, token, reconnect)
+    def __init__(self, host="127.0.0.1", port=4242, username="", capabilities=None, token=None, reconnect=True,
+                 ssl=None):
+        super().__init__(host, port, username, token, reconnect, ssl)
         self.capabilities = capabilities if capabilities is not None else {}
         self._handler = None
 

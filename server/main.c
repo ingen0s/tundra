@@ -28,13 +28,17 @@ static void tick(void) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "usage: %s [-p port] [-w http-port] [-d database] [-t tokens-file [-A]] [-i idle-timeout-s] [-g resume-grace-s]\n"
+            "usage: %s [-p port] [-w http-port] [-C cert.pem -K key.pem] [-d database] [-t tokens-file [-A]] [-i idle-timeout-s] [-g resume-grace-s]\n"
             "          [-T agent-timeout-s] [-v]\n"
             "  -w  also serve the web client and WebSockets (GET /ws) on this port\n"
+            "%s"
             "  -d  keep messages in this SQLite database (history survives restarts)\n"
             "  -t  \"username token\" file: listed names must present their token (re-read on SIGHUP)\n"
             "  -A  with -t, every username must be listed\n",
-            prog);
+            prog,
+            tls_available() ? "  -C  TLS certificate chain (PEM); with -K, both ports use TLS (wss/https on -w)\n"
+                              "  -K  TLS private key (PEM)\n"
+                            : "  -C, -K  TLS certificate and key (not in this build: rebuild with OpenSSL)\n");
 }
 
 int main(int argc, char **argv) {
@@ -42,11 +46,15 @@ int main(int argc, char **argv) {
     const char *db_path = NULL;
     const char *tokens_path = NULL;
     int ws_port = 0;
+    const char *tls_cert = NULL;
+    const char *tls_key = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "p:w:d:t:Ai:g:T:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "p:w:d:t:AC:K:i:g:T:vh")) != -1) {
         switch (opt) {
             case 'd': db_path = optarg; break;
             case 'w': ws_port = atoi(optarg); break;
+            case 'C': tls_cert = optarg; break;
+            case 'K': tls_key = optarg; break;
             case 't': tokens_path = optarg; break;
             case 'A': auth_require_all = 1; break;
             case 'p': port = atoi(optarg); break;
@@ -62,6 +70,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (!tls_cert != !tls_key) {
+        fprintf(stderr, "-C and -K go together\n");
+        return 1;
+    }
+    if (tls_cert && tls_init(tls_cert, tls_key) < 0) return 1;
     if (auth_require_all && !tokens_path) {
         fprintf(stderr, "-A needs -t\n");
         return 1;
@@ -73,7 +86,7 @@ int main(int argc, char **argv) {
 
     if (net_listen(port) < 0) return 1;
     if (ws_port && net_listen_ws(ws_port) < 0) return 1;
-    if (ws_port) log_info("web client and WebSockets on http://localhost:%d/", ws_port);
+    if (ws_port) log_info("web client and WebSockets on %s://localhost:%d/", tls_enabled() ? "https" : "http", ws_port);
     log_info("Tundra server listening on port %d", port);
 
     last_ping = mono_s();
@@ -87,6 +100,7 @@ int main(int argc, char **argv) {
     msglog_free();
     plat_shutdown_complete();
     store_close();
+    tls_free();
     auth_free();
     return 0;
 }
