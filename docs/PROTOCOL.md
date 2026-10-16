@@ -24,7 +24,7 @@ A frame is always exactly `7 + length` bytes, so the largest frame is 65542 byte
 ## Transports
 
 - **TCP** (default port 4242): frames are written back to back on the stream.
-- **WebSocket** (`-w PORT`, path `/ws`): each binary WebSocket message carries exactly one Tundra frame, in both directions. Client messages must be unfragmented binary messages (what browsers send); text messages are refused with close code 1003, unmasked or extension frames with 1002, and messages larger than one frame with 1009. WebSocket ping/pong is answered, but the Tundra `PING`/`PONG` still applies. The same port serves the bundled web client at `/`.
+- **WebSocket** (`-w PORT`, path `/ws`): each binary WebSocket message carries exactly one Tundra frame, in both directions. Client messages must be unfragmented binary messages (what browsers send) holding exactly one complete frame. The server closes the connection with 1003 for text or continuation frames, 1002 for unmasked frames, extension bits, fragmented or oversized control frames and malformed close frames, 1007 for a binary message that is fragmented or is not exactly one frame, and 1009 for messages larger than one frame. A close from the client is answered with the same code. HTTP request headers are limited to 8 KiB. WebSocket ping/pong is answered, but the Tundra `PING`/`PONG` still applies. The same port serves the bundled web client at `/`.
 
 ## Field notation
 

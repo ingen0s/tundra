@@ -142,16 +142,19 @@ static void http_reply(Client *c, const char *status, const char *type, const ui
 /* Handles a buffered HTTP request. Returns the bytes consumed, or 0 if the
  * request is not complete yet. */
 static size_t handle_http(Client *c) {
-    if (c->in_len > MAX_HTTP_REQUEST) {
+    /* Only the headers count toward the limit: a client may send WebSocket
+     * frames right behind the upgrade request in the same write. */
+    size_t head = c->in_len < MAX_HTTP_REQUEST ? c->in_len : MAX_HTTP_REQUEST;
+    /* the buffer is not NUL-terminated; work on a terminated copy */
+    char req[MAX_HTTP_REQUEST + 1];
+    memcpy(req, c->in, head);
+    req[head] = '\0';
+    char *end = strstr(req, "\r\n\r\n");
+    if (!end) {
+        if (c->in_len < MAX_HTTP_REQUEST) return 0; /* wait for the rest */
         http_reply(c, "431 Request Header Fields Too Large", "text/plain", (const uint8_t *)"too large\n", 10);
         return c->in_len;
     }
-    /* the buffer is not NUL-terminated; work on a terminated copy */
-    char req[MAX_HTTP_REQUEST + 1];
-    memcpy(req, c->in, c->in_len);
-    req[c->in_len] = '\0';
-    char *end = strstr(req, "\r\n\r\n");
-    if (!end) return 0;
     size_t consumed = (size_t)(end - req) + 4;
     end[2] = '\0'; /* keep the last header's CRLF for header_value */
 
@@ -251,7 +254,11 @@ static size_t handle_ws(Client *c) {
             ws_close(c, 1002);
             break;
         }
-        if (len > TUNDRA_MAX_FRAME || (opcode >= 0x8 && len > 125)) {
+        if (opcode >= 0x8 && (!fin || len > 125)) { /* control frames: unfragmented, short */
+            ws_close(c, 1002);
+            break;
+        }
+        if (len > TUNDRA_MAX_FRAME) {
             ws_close(c, 1009);
             break;
         }
@@ -269,8 +276,12 @@ static size_t handle_ws(Client *c) {
                 }
                 handle_frame(c, data, (size_t)len - TUNDRA_HEADER_LEN);
                 break;
-            case 0x8: /* close */
-                ws_close(c, 1000);
+            case 0x8: /* close: echo the client's code, or 1000 when it sent none */
+                if (len == 1) {
+                    ws_close(c, 1002);
+                } else {
+                    ws_close(c, len >= 2 ? tundra_get_u16(data) : 1000);
+                }
                 return off;
             case 0x9: /* ping */
                 ws_control(c, 0xA, data, (size_t)len);

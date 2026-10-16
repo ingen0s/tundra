@@ -141,8 +141,9 @@ function readChat(r) {
 const S = {
   ws: null, me: "", token: "", sessionId: null, lastId: 0n, seq: 0, nextReq: 1,
   convs: new Map(),          // key -> {kind, name, msgs: [], unread, seen: Set}
-  current: LOBBY_KEY(), agents: [], pending: new Map(), wantClose: false, retry: 0,
+  current: LOBBY_KEY(), agents: [], pending: new Map(), wantClose: false, retry: 0, rejoin: [],
 };
+const MAX_TEXT = 65535 - 35 - 2 - 85;   // bytes; matches TUNDRA_MAX_TEXT
 function LOBBY_KEY() { return "#lobby"; }
 const $ = id => document.getElementById(id);
 
@@ -170,6 +171,7 @@ function connect() {
   S.ws = ws;
   setStatus("connecting...");
   ws.onopen = () => {
+    S.pending.clear();  // replies to requests sent on an earlier connection will not come
     const w = new Writer().bytes(S.sessionId || new Uint8Array(16)).str8(S.me);
     if (S.sessionId && S.lastId > 0n) w.u8(0x01).u16(8).u64(S.lastId);  // RESUME_FROM
     if (S.token) { const t = enc.encode(S.token); w.u8(0x02).u16(t.length).bytes(t); }  // TOKEN
@@ -197,7 +199,16 @@ function onFrame(f) {
         S.retry = 0;
         showApp();
         setStatus("connected as " + S.me);
-        if (!resumed) { conv("#lobby").joined = true; refreshAgents(); }
+        if (!resumed) {
+          // a new session: ids may restart (a server without a database), so forget what we saw
+          for (const c of S.convs.values()) c.seen.clear();
+          S.lastId = 0n;
+          conv("#lobby").joined = true;
+          refreshAgents();
+          // a fresh session after the old one expired: rejoin the rooms we were in
+          for (const room of S.rejoin) send(T.JOIN, new Writer().str8(room));
+          S.rejoin = [];
+        }
         renderSide();
       }
       addLine(S.current, { sys: true, text });
@@ -229,6 +240,7 @@ function onFrame(f) {
       break;
     }
     case T.AGENT_LIST: {
+      r.u8();  // truncated flag: the list holds as many agents as fit in one frame
       let n = r.u16(); S.agents = [];
       while (n-- > 0) S.agents.push({ name: r.str8(), online: r.u8() === 1, caps: r.str16() });
       renderSide();
@@ -244,9 +256,20 @@ function onFrame(f) {
     case T.ERROR: {
       const code = r.u16(), text = r.str16();
       S.pending.delete(seqNo);
-      if (!S.sessionId) {
-        if (code === 3) { S.sessionId = null; S.lastId = 0n; }  // session gone: register fresh next time
+      if (code === 3) {
+        // our session expired (server restart, or away too long): start a fresh one
+        S.rejoin = [...S.convs].filter(([k, c]) => c.kind === 0 && c.joined && k !== "#lobby").map(([k]) => k);
+        for (const c of S.convs.values()) c.joined = false;
+        S.sessionId = null; S.lastId = 0n;
+        addLine(S.current, { sys: true, text: "Session expired; starting a new one" });
+        S.ws.close();  // onclose reconnects and registers fresh
+        return;
+      }
+      if (!S.sessionId || code === 9) {
+        // registration refused (name taken, invalid, bad token) or token revoked: stop and show it
         $("loginError").textContent = text;
+        $("login").classList.remove("hidden"); $("app").classList.add("hidden");
+        S.sessionId = null; S.lastId = 0n;
         S.wantClose = true; S.ws.close();
         return;
       }
@@ -273,7 +296,13 @@ function addChat(m) {
   if (c.seen.has(m.id)) return;
   c.seen.add(m.id);
   c.msgs.push({ id: m.id, ts: m.ts, who: m.sender, text: m.text, mine: m.sender === S.me });
-  c.msgs.sort((a, b) => (a.id && b.id ? (a.id < b.id ? -1 : 1) : 0));
+  // keep chats in id order; lines without an id (notices) stay where they were added
+  if (c.msgs.length > 1 && c.msgs[c.msgs.length - 2].id && m.id < c.msgs[c.msgs.length - 2].id) {
+    const ided = c.msgs.filter(x => x.id).sort((a, b) => (a.id < b.id ? -1 : 1));
+    let i = 0;
+    c.msgs = c.msgs.map(x => (x.id ? ided[i++] : x));
+  }
+  if (c.msgs.length > 2000) c.msgs.splice(0, c.msgs.length - 2000);
   if (keyOf(m) !== S.current) c.unread++;
   render();
 }
@@ -355,6 +384,7 @@ $("login").onsubmit = e => {
   $("loginError").textContent = "";
   S.me = $("name").value.trim(); S.token = $("token").value; S.wantClose = false;
   if (!/^[!-~]{1,32}$/.test(S.me) || S.me.startsWith("#")) { $("loginError").textContent = "Use 1 to 32 characters, no spaces, not starting with #."; return; }
+  S.sessionId = null; S.lastId = 0n; S.retry = 0;
   connect();
 };
 
@@ -362,6 +392,14 @@ $("compose").onsubmit = e => {
   e.preventDefault();
   const text = $("text").value;
   if (!text.trim()) return;
+  if (enc.encode(text).length > MAX_TEXT) {
+    addLine(S.current, { err: true, text: "That message is too long (limit " + MAX_TEXT + " bytes)." });
+    return;
+  }
+  if (!S.ws || S.ws.readyState !== 1 || !S.sessionId) {
+    addLine(S.current, { err: true, text: "Not connected; your message was not sent." });
+    return;
+  }
   const key = S.current, isAgent = S.agents.some(a => "@" + a.name === key);
   if (isAgent) {
     const name = key.slice(1), id = S.nextReq++;

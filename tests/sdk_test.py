@@ -83,6 +83,15 @@ async def main():
     check("automatic reconnect catches up on missed messages", msg is not None and msg.text == "while you were gone")
     check("session id survives the reconnect", alice.session_id is not None)
 
+    # a refused connect does not leave a reconnect loop behind
+    dup = tundra.Client("127.0.0.1", PORT, "pybob")
+    try:
+        await dup.connect()
+        check("taken name is refused", False)
+    except tundra.TundraError as e:
+        check("taken name is refused", e.code == 1)
+    check("refused client leaves no background task", dup._task is None and dup._writer is None)
+
     for c in (alice, bob, agent):
         await c.close()
 

@@ -56,6 +56,21 @@ const report = (name, ok) => { if (!ok) failed = true; console.log((ok ? "ok   -
     await sleep(500);
     report("agent answered", logText(a).includes("echo: ping the agent"));
   }
+  // the server restarts: the old session is gone, the client must start a new one
+  console.log("restart-now");
+  const fs = require("fs");
+  for (let i = 0; i < 100 && !fs.existsSync(process.argv[3]); i++) await sleep(100);
+  for (let i = 0; i < 100 && !a.d.getElementById("status").textContent.includes("connected as webalice"); i++) await sleep(100);
+  await sleep(500);
+  report("reconnects with a new session after a restart", a.d.getElementById("status").textContent.includes("connected as webalice"));
+  [...a.d.getElementById("rooms").querySelectorAll(".item")].find(e => e.textContent.startsWith("#lobby"))?.click();
+  say(a, "after the restart");
+  await sleep(400);
+  const ok = logText(a).includes("after the restart") && !logText(a).includes("Not connected");
+  if (!ok) console.log(logText(a).slice(-300));
+  report("can send after a restart", ok);
+  report("rejoined rooms after a restart", a.d.getElementById("rooms").textContent.includes("#web"));
+
   // bad name is rejected client-side
   const c = await JSDOM.fromURL(`http://127.0.0.1:${port}/`, OPTS);
   c.window.document.getElementById("name").value = "has space";

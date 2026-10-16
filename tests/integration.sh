@@ -917,7 +917,7 @@ PORT=$((BASE_PORT + 7))
 WSPORT=$((BASE_PORT + 8))
 start_server ws "$PORT" -w "$WSPORT"
 raw >"$TMP/ws.out" <<'PY'
-import sys, struct, urllib.request, urllib.error
+import sys, struct, socket, urllib.request, urllib.error
 from tundra_raw import *
 port = int(sys.argv[1]); wsport = port + 1
 
@@ -970,6 +970,35 @@ except urllib.error.HTTPError as e:
     print("http-404", e.code)
 bad = WsConn(wsport, key="")
 print("bad-handshake", bad.handshake.split("\r\n")[0])
+
+# upgrade request and a large first frame in one write is not a 431
+sock = socket.create_connection(("127.0.0.1", wsport))
+sock.settimeout(2)
+req = ("GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+       "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").encode()
+reg = WsConn.ws_frame(register(b"eager"))
+pad = WsConn.ws_frame(frame(0x02, s16(b"p" * 9000)))  # a 9 KB frame before REGISTER: gets an error, then registers
+sock.sendall(req + pad + reg)
+resp = b""
+while b"\r\n\r\n" not in resp:
+    resp += sock.recv(4096)
+e = WsConn.__new__(WsConn); e.sock = sock; e.raw = resp.partition(b"\r\n\r\n")[2]; e.buf = b""
+f = e.wait_for(0x10)
+print("handshake-plus-frames", resp.split(b"\r\n")[0].decode(), f[0] if f else None)
+
+# a fragmented ping is a protocol error; a close code is echoed
+g = WsConn(wsport); g.send(register(b"fragger")); g.recv_frame()
+g.sock.sendall(WsConn.ws_frame(b"x", opcode=0x9, fin=False))
+m = g.recv_ws()
+while m and m[0] != 8:
+    m = g.recv_ws()
+print("fragmented-control", struct.unpack(">H", m[1][:2])[0] if m else None)
+h = WsConn(wsport); h.send(register(b"closer")); h.recv_frame()
+h.sock.sendall(WsConn.ws_frame(struct.pack(">H", 4001), opcode=0x8))
+m = h.recv_ws()
+while m and m[0] != 8:
+    m = h.recv_ws()
+print("close-echo", struct.unpack(">H", m[1][:2])[0] if m else None)
 PY
 expect "websocket handshake accept key" "$TMP/ws.out" "accept True"
 expect "register over websocket" "$TMP/ws.out" "ws-register 16"
@@ -984,6 +1013,9 @@ expect "unmasked client frames refused with 1002" "$TMP/ws.out" "unmasked-refuse
 expect "web client served at /" "$TMP/ws.out" "web-client True"
 expect "unknown paths 404" "$TMP/ws.out" "http-404 404"
 expect "bad handshake is a 400" "$TMP/ws.out" "bad-handshake HTTP/1.1 400 Bad Request"
+expect "frames sent with the upgrade request are fine" "$TMP/ws.out" "handshake-plus-frames HTTP/1.1 101 Switching Protocols 16"
+expect "fragmented control frames are refused with 1002" "$TMP/ws.out" "fragmented-control 1002"
+expect "a close code is echoed" "$TMP/ws.out" "close-echo 4001"
 
 # 25. Python SDK
 if python3 "$ROOT/tests/sdk_test.py" "$PORT" >"$TMP/sdk.out" 2>&1; then :; else FAILED=1; fi

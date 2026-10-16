@@ -46,6 +46,8 @@ CHAT, SENT, ROOM_LIST, ROOM_EVENT, HISTORY_RESULT, WHO_RESULT = 0x17, 0x18, 0x19
 AGENT_LIST, AGENT_REQUEST_IN, AGENT_RESPONSE_IN = 0x30, 0x31, 0x32
 
 REG_RESUME_FROM, REG_TOKEN = 0x01, 0x02
+# errors that retrying cannot fix: name taken, invalid name, unauthorized
+FATAL_ERRORS = {1, 8, 9}
 STATUS = {0: "ok", 1: "error", 2: "rejected", 3: "timeout", 4: "unavailable"}
 REPLY_TYPES = {SYSTEM, ERROR, SENT, ROOM_LIST, WHO_RESULT, HISTORY_RESULT, HEALTH_RESULT, AGENT_LIST}
 
@@ -151,29 +153,47 @@ class Client:
         self._closing = False
         self._ack_handle = None
         self._connected = asyncio.Event()
+        self.error = None             # set when the client gives up (see FATAL_ERRORS)
 
     # ---- connection ----
 
-    async def connect(self):
-        """Connects and registers (or resumes). Raises TundraError on refusal."""
-        self._reader, self._writer = await asyncio.open_connection(self.host, self.port)
+    def _register_payload(self):
         ext = b""
         if self.session_id and self.last_id:
             ext += bytes([REG_RESUME_FROM]) + struct.pack(">HQ", 8, self.last_id)
         if self.token:
             tok = self.token.encode()
             ext += bytes([REG_TOKEN]) + struct.pack(">H", len(tok)) + tok
-        sid = self.session_id or bytes(16)
-        fut = self._send(REGISTER, sid + _s8(self.username) + ext, expect_reply=True)
+        return (self.session_id or bytes(16)) + _s8(self.username) + ext
+
+    def _drop_writer(self):
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None
+
+    async def connect(self):
+        """Connects and registers (or resumes). Raises TundraError on refusal;
+        a refused client does not keep reconnecting in the background."""
+        self._closing = False
+        self._reader, self._writer = await asyncio.open_connection(self.host, self.port)
+        fut = self._send(REGISTER, self._register_payload(), expect_reply=True)
         if self._task is None or self._task.done():
             self._task = asyncio.ensure_future(self._read_loop())
-        ftype, payload = await asyncio.wait_for(fut, 10)
-        if ftype == ERROR:
-            r = _R(payload)
-            code, text = r.u16(), r.s16()
-            if code == 3:  # session expired: next attempt registers fresh
-                self.session_id = None
-            raise TundraError(code, text)
+        try:
+            ftype, payload = await asyncio.wait_for(fut, 10)
+            if ftype == ERROR:
+                r = _R(payload)
+                code, text = r.u16(), r.s16()
+                if code == 3:  # session expired: the next attempt registers fresh
+                    self.session_id = None
+                raise TundraError(code, text)
+        except BaseException:
+            self._closing = True
+            if self._task:
+                self._task.cancel()
+                self._task = None
+            self._drop_writer()
+            raise
         self.session_id = bytes(payload[:16])
         self._connected.set()
         await self._on_connected()
@@ -183,20 +203,22 @@ class Client:
 
     async def close(self):
         self._closing = True
-        if self._writer:
-            self._writer.close()
+        if self._ack_handle is not None:
+            self._ack_handle.cancel()
+            self._ack_handle = None
+        self._drop_writer()
         if self._task:
             self._task.cancel()
 
     def _send(self, ftype, payload=b"", expect_reply=False):
+        if self._writer is None:
+            raise ConnectionError("not connected")
         seq = self._seq & 0xFFFF
         self._seq += 1
         fut = None
         if expect_reply:
-            fut = asyncio.get_event_loop().create_future()
+            fut = asyncio.get_running_loop().create_future()
             self._replies[seq] = fut
-        if self._writer is None:
-            raise ConnectionError("not connected")
         self._writer.write(struct.pack(">BBHHB", VERSION, 0, seq, len(payload), ftype) + payload)
         return fut
 
@@ -226,6 +248,7 @@ class Client:
             if not fut.done():
                 fut.set_exception(ConnectionError("connection lost"))
         self._replies.clear()
+        self._drop_writer()
         delay = 0.2
         while not self._closing:
             await asyncio.sleep(delay)
@@ -235,25 +258,36 @@ class Client:
                 delay = min(delay * 2, 5)
                 continue
             # register inline: the read loop is this coroutine
-            ext = b""
-            if self.session_id and self.last_id:
-                ext += bytes([REG_RESUME_FROM]) + struct.pack(">HQ", 8, self.last_id)
-            if self.token:
-                tok = self.token.encode()
-                ext += bytes([REG_TOKEN]) + struct.pack(">H", len(tok)) + tok
-            self._send(REGISTER, (self.session_id or bytes(16)) + _s8(self.username) + ext)
+            fresh = self.session_id is None
+            self._send(REGISTER, self._register_payload())
             try:
                 head = await self._reader.readexactly(7)
                 payload = await self._reader.readexactly(struct.unpack(">H", head[4:6])[0])
             except (asyncio.IncompleteReadError, ConnectionError, OSError):
+                self._drop_writer()
                 continue
             if head[6] == SYSTEM:
                 self.session_id = bytes(payload[:16])
+                if fresh:
+                    # a new session: ids may restart (a server without a database)
+                    self._seen.clear()
+                    self.last_id = 0
                 self._connected.set()
                 asyncio.ensure_future(self._on_connected())
                 return
-            if head[6] == ERROR and _R(payload).u16() == 3:
-                self.session_id = None  # expired: register fresh on the next try
+            if head[6] == ERROR:
+                r = _R(payload)
+                code, text = r.u16(), r.s16()
+                if code in FATAL_ERRORS:
+                    # retrying cannot help: give up and let messages() end
+                    self.error = TundraError(code, text)
+                    self._closing = True
+                    self._drop_writer()
+                    self._inbox.put_nowait(None)
+                    return
+                if code == 3:
+                    self.session_id = None  # expired: register fresh on the next try
+            self._drop_writer()
             delay = min(delay * 2, 5)
 
     def _dispatch(self, seq, ftype, payload):
@@ -291,7 +325,7 @@ class Client:
 
     def _schedule_ack(self):
         if self._ack_handle is None:
-            self._ack_handle = asyncio.get_event_loop().call_later(0.2, self._send_ack)
+            self._ack_handle = asyncio.get_running_loop().call_later(0.2, self._send_ack)
 
     def _send_ack(self):
         self._ack_handle = None
@@ -327,9 +361,15 @@ class Client:
         return {r.s8(): r.u16() for _ in range(r.u16())}
 
     async def messages(self):
-        """Yields every chat message received, including catch-up after a resume."""
+        """Yields every chat message received, including catch-up after a resume.
+        Ends if the client gives up reconnecting (see `error`)."""
         while True:
-            yield await self._inbox.get()
+            msg = await self._inbox.get()
+            if msg is None:
+                if self.error:
+                    raise self.error
+                return
+            yield msg
 
     # ---- agents ----
 
@@ -337,6 +377,7 @@ class Client:
         """Returns {name: {"online": bool, "capabilities": parsed JSON or str}}."""
         _, body = await self._request(LIST_AGENTS)
         r = _R(body)
+        self.agents_truncated = bool(r.u8())  # more agents exist than fit in one frame
         out = {}
         for _ in range(r.u16()):
             name, online, caps = r.s8(), r.u8(), r.s16()
