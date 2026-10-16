@@ -29,6 +29,7 @@ Room *room_get_or_create(TundraBytes name) {
             r = &rooms[i];
             memset(r, 0, sizeof(*r));
             r->used = 1;
+            r->first_msg_id = msglog_last_id() + 1;
             memcpy(r->name, name.p, name.len);
             r->name[name.len] = '\0';
             return r;
@@ -84,8 +85,9 @@ void room_event(Room *r, uint8_t event, const Session *who) {
     long n = tundra_encode(&m, buf, sizeof(buf));
     if (n < 0) return;
     room_deliver(r, who, MSG_ROOM_EVENT, buf, (size_t)n);
-    /* the subject always hears about their own join/leave, member or not */
-    if (who->state == SESSION_ACTIVE && who->client) push_frame(who->client, MSG_ROOM_EVENT, buf, (size_t)n);
+    /* the subject always hears about their own join/leave, member or not;
+     * deliver() keeps it behind anything still being replayed */
+    deliver((Session *)who, MSG_ROOM_EVENT, buf, (size_t)n);
 }
 
 void rooms_remove_session(Session *s) {

@@ -39,6 +39,8 @@ static void handle_register(Client *c, uint16_t seq, const TundraMsg *m) {
             /* the old connection is still attached (e.g. half-open); replace it */
             mark_dead(s->client);
         }
+        /* hold the replay until the welcome and any drop notice are out */
+        s->pumping = 1;
         attach(s, c);
         char msg[96];
         snprintf(msg, sizeof(msg), "Welcome back, %s!", username);
@@ -49,6 +51,7 @@ static void handle_register(Client *c, uint16_t seq, const TundraMsg *m) {
             send_system(c, seq, nil_uuid, msg);
             s->backlog_dropped = 0;
         }
+        s->pumping = 0;
         backlog_pump(s);
         log_info("%s resumed session", username);
         return;
@@ -169,12 +172,14 @@ static void handle_leave(Client *c, uint16_t seq, TundraBytes name) {
     if (r->used) {
         room_event(r, ROOM_LEFT, me);
     } else {
-        /* the room is gone; still confirm to the leaver */
+        /* the room is gone; still confirm to the leaver, in order */
         TundraMsg ev = { .type = MSG_ROOM_EVENT };
         ev.u.room_event.event = ROOM_LEFT;
         ev.u.room_event.room = name;
         ev.u.room_event.user = cstr(me->username);
-        send_msg(c, &ev, 0, 1);
+        uint8_t buf[128];
+        long n = tundra_encode(&ev, buf, sizeof(buf));
+        if (n >= 0) deliver(me, MSG_ROOM_EVENT, buf, (size_t)n);
     }
 }
 
@@ -209,18 +214,23 @@ static void handle_who(Client *c, uint16_t seq, TundraBytes name) {
     static uint8_t entries[TUNDRA_MAX_PAYLOAD];
     TundraWriter w = tundra_writer(entries, TUNDRA_MAX_PAYLOAD - 64);
     uint16_t count = 0;
-    for (int i = 0; i < MAX_SESSIONS && w.ok; i++) {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
         Session *s = &sessions[i];
         if (s->state == SESSION_FREE || !room_is_member(r, s)) continue;
+        size_t before = w.len;
         tundra_wr_who_entry(&w, cstr(s->username), s->state == SESSION_ACTIVE);
-        if (w.ok) count++;
+        if (!w.ok) {
+            w.ok = 1; /* full: stop at the last member that fit */
+            w.len = before;
+            break;
+        }
+        count++;
     }
     TundraMsg m = { .type = MSG_WHO_RESULT };
     m.u.list.room = cstr(r->name);
     m.u.list.count = count;
     m.u.list.entries.p = entries;
-    m.u.list.entries.len = w.ok ? w.len : 0;
-    if (!w.ok) m.u.list.count = 0;
+    m.u.list.entries.len = w.len;
     send_msg(c, &m, seq, 0);
 }
 
@@ -252,6 +262,7 @@ static void handle_history(Client *c, uint16_t seq, const TundraMsg *req) {
     for (; id > 0 && npicked < limit; id--) {
         const LoggedMessage *lm = msglog_get(id);
         if (!lm) break; /* evicted: nothing older is held either */
+        if (lm->id < r->first_msg_id) break; /* older messages belong to an earlier room of this name */
         if (lm->kind != CHAT_ROOM || strcmp(lm->target, r->name) != 0) continue;
         size_t sz = chat_entry_size(lm);
         if (sz > budget) break;

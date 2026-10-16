@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -37,8 +38,8 @@ Session *find_session_by_bytes(TundraBytes name) {
 
 void release_session(Session *s) {
     log_info("%s session released", s->username);
-    backlog_clear(s);
-    rooms_remove_session(s); /* sends "left" events */
+    rooms_remove_session(s); /* sends "left" events, which may queue one for s itself */
+    backlog_clear(s);        /* so clear afterwards */
     s->state = SESSION_FREE;
 }
 
@@ -139,6 +140,14 @@ void backlog_pump(Session *s) {
         free(item.payload);
     }
     s->pumping = 0;
+    /* frames dropped while this session was online but behind */
+    if (s->backlog_count == 0 && s->backlog_dropped && s->state == SESSION_ACTIVE && s->client && !s->client->dead) {
+        static const uuid_t nil = {0};
+        char msg[96];
+        snprintf(msg, sizeof(msg), "%u message(s) were dropped because you fell behind", s->backlog_dropped);
+        s->backlog_dropped = 0;
+        send_system(s->client, 0, nil, msg);
+    }
 }
 
 void deliver(Session *s, uint8_t type, const uint8_t *payload, size_t len) {

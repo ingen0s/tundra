@@ -5,7 +5,7 @@
  * All multi-byte integers are big-endian (network order).
  *
  *   offset 0  version   u8   always 0x01
- *   offset 1  flags     u8   reserved, must be 0
+ *   offset 1  flags     u8   reserved: send 0, ignored by the server
  *   offset 2  seq       u16  sequence number
  *   offset 4  length    u16  number of payload bytes AFTER the 7-byte header
  *   offset 6  type      u8   message type
@@ -31,8 +31,10 @@
 #define TUNDRA_MAX_HISTORY  100 /* entries per HISTORY request */
 
 /* Longest chat text that still fits in any frame that carries it. The
- * largest is CHAT: id(8) ts(8) kind(1) target(1+32) sender(1+32) mlen(2). */
-#define TUNDRA_MAX_TEXT (TUNDRA_MAX_PAYLOAD - 85)
+ * tightest is HISTORY_RESULT holding one entry: room(1+32) count(2), then
+ * len(2) and a CHAT payload of id(8) ts(8) kind(1) target(1+32)
+ * sender(1+32) mlen(2) text. */
+#define TUNDRA_MAX_TEXT (TUNDRA_MAX_PAYLOAD - 35 - 2 - 85)
 
 /* Type ranges: 0x01-0x0F and 0x20-0x2F are client -> server,
  * 0x10-0x1F and 0x30-0x3F are server -> client. */
@@ -41,7 +43,7 @@ enum TundraMessageType {
     MSG_REGISTER          = 0x01, /* id(16) ulen(1) username(ulen)                    */
     MSG_MESSAGE           = 0x02, /* mlen(2) text: shorthand for SEND to #lobby       */
     MSG_AGENT_COMMAND     = 0x03, /* alen(1) agent clen(2) command                    */
-    MSG_PONG              = 0x04, /* echo of the PING payload (optional)              */
+    MSG_PONG              = 0x04, /* echo of the PING payload; keeps the connection alive */
     MSG_HEALTH_CHECK      = 0x05, /* empty                                            */
     MSG_JOIN              = 0x06, /* rlen(1) room                                     */
     MSG_LEAVE             = 0x07, /* rlen(1) room                                     */

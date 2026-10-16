@@ -76,6 +76,7 @@ typedef struct Client {
 typedef struct {
     int used;
     char name[TUNDRA_MAX_ROOM + 1];
+    uint64_t first_msg_id;      /* messages before this belong to an earlier room of the same name */
     uint8_t members[(MAX_SESSIONS + 7) / 8]; /* bit per session index */
     int member_count;
 } Room;

@@ -30,7 +30,7 @@ A frame is always exactly `7 + length` bytes, so the largest frame is 65542 byte
 | `str16` | `u16` length, then that many bytes |
 | `id16` | 16 raw bytes (a UUID) |
 
-Text is UTF-8 by convention; the server does not inspect it. Chat text is limited to 65,450 bytes so that it fits in every frame that carries it.
+Text is UTF-8 by convention; the server does not inspect it. Chat text is limited to 65,413 bytes so that it fits in every frame that carries it, including a `HISTORY_RESULT` entry with maximum-length names.
 
 ## Names
 
@@ -77,7 +77,7 @@ Message ids are assigned by the server, are unique, and increase by one per mess
 
 1. `REGISTER` with an all-zero id. The welcome `SYSTEM` frame carries your session id, and you are joined to `#lobby` (you get a `ROOM_EVENT` for it).
 2. If the connection drops, the session, its username and its room memberships are held for 2 minutes. Frames for it are buffered: up to 50 frames and 1 MiB per session (64 MiB across the server), oldest dropped first.
-3. `REGISTER` with the same id and username to resume. The backlog is delivered right after the welcome, paced so it never overflows the connection; if anything was dropped, a `SYSTEM` notice says how many. If the old connection is still open it is closed. An unknown or expired id, or someone else's id, gets `SESSION_EXPIRED`: register again with a zero id.
+3. `REGISTER` with the same id and username to resume. The welcome comes first, then a `SYSTEM` notice if anything was dropped, then the backlog, paced so it never overflows the connection. If a connected client falls behind far enough that frames are dropped, it gets a similar notice once it catches up. If the old connection is still open it is closed. An unknown or expired id, or someone else's id, gets `SESSION_EXPIRED`: register again with a zero id.
 4. After the hold period the session is released, its username becomes free, and each of its rooms gets a "left" event. When the session table is full, the longest-detached session is released early to make room.
 
 Registered connections that send nothing for 2 minutes are dropped; the server pings every 30 seconds, so answering with `PONG` is enough. Each client's outgoing queue is capped at 1 MiB; a client that falls further behind is disconnected and loses what was still queued for it.
@@ -88,11 +88,13 @@ Registered connections that send nothing for 2 minutes are dropped; the server p
 - `LEAVE` sends `ROOM_EVENT left` to the remaining members and the leaver. Empty rooms are deleted, except `#lobby`.
 - Room messages go to every member except the sender. Members who are disconnected get them in their backlog.
 - `HISTORY` and sending require membership. `WHO` and `LIST_ROOMS` do not.
+- A room that empties and is created again starts with an empty history.
+- `JOIN` for a room you are already in gets `INVALID_FORMAT` ("Already in that room").
 - The server keeps the most recent 10,000 messages (and at most 64 MiB of text) in memory for `HISTORY`.
 
 ## Direct messages
 
-`SEND` with kind 1 delivers to one user, online or within their hold period. The sender gets `SENT`; the recipient gets a `CHAT` whose target is their own username.
+`SEND` with kind 1 delivers to one user, online or within their hold period. The sender gets `SENT`; the recipient gets a `CHAT` whose target is their own username. A direct message to yourself is accepted and stored (you get `SENT`) but not echoed back.
 
 ## Error codes
 

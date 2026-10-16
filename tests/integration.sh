@@ -231,7 +231,7 @@ raw >"$TMP/raw.out" <<'PY'
 import sys
 from tundra_raw import *
 port = int(sys.argv[1])
-MAX_TEXT = 65535 - 85
+MAX_TEXT = 65535 - 35 - 2 - 85
 
 c = Conn(port)
 c.send(frame(0x02, s16(b"hi")))
@@ -326,6 +326,79 @@ c.send(register(b"latecomer"))
 print("fillers", ok, "latecomer", "welcome" if c.wait_for(0x10) else "refused")
 PY
 expect "full session table makes room for new users" "$TMP/fill.out" "latecomer welcome"
+
+# 18c. review regressions: history limits, recreated rooms, resume order
+raw >"$TMP/roomfix.out" <<'PY'
+import sys, struct, time
+from tundra_raw import *
+port = int(sys.argv[1])
+MAX_TEXT = 65535 - 35 - 2 - 85
+room = b"#" + b"r" * 31
+user = b"u" * 32
+
+# a maximum-size message with maximum-length names still fits in HISTORY
+c = Conn(port)
+c.send(register(user))
+c.wait_for(0x10)
+c.send(frame(0x06, s8(room)))
+c.wait_for(0x1A)
+c.send(frame(0x08, bytes([0]) + s8(room) + s16(b"x" * MAX_TEXT)))
+f = c.wait_for(0x18)
+print("max-message-sent", f is not None)
+c.send(frame(0x0B, s8(room) + struct.pack(">QH", 0, 10)))
+f = c.wait_for(0x1B)
+print("max-message-in-history", struct.unpack(">H", f[1][33:35])[0] if f else None)
+
+# a deleted and recreated room does not show the old room's messages
+a = Conn(port)
+a.send(register(b"oldroomer"))
+a.wait_for(0x10)
+a.send(frame(0x06, s8(b"#reuse")))
+a.wait_for(0x1A)
+a.send(frame(0x08, bytes([0]) + s8(b"#reuse") + s16(b"old secret")))
+a.wait_for(0x18)
+a.send(frame(0x07, s8(b"#reuse")))  # last member leaves: room deleted
+a.wait_for(0x1A)
+b = Conn(port)
+b.send(register(b"newroomer"))
+b.wait_for(0x10)
+b.send(frame(0x06, s8(b"#reuse")))
+b.wait_for(0x1A)
+b.send(frame(0x0B, s8(b"#reuse") + struct.pack(">QH", 0, 10)))
+f = b.wait_for(0x1B)
+print("recreated-room-history", struct.unpack(">H", f[1][7:9])[0] if f else None)
+
+# resume order: welcome, then the drop notice, then the backlog
+r = Conn(port)
+r.send(register(b"orderly"))
+sid = r.wait_for(0x10)[1][:16]
+r.sock.close()
+time.sleep(0.3)
+t = Conn(port)
+t.send(register(b"orderflood"))
+t.wait_for(0x10)
+for i in range(55):
+    t.send(frame(0x02, s16(b"o%d" % i)))
+while t.wait_for(0x18, 0.3):
+    pass
+r = Conn(port)
+r.send(register(b"orderly", sid))
+kinds = []
+while True:
+    f = r.recv_frame()
+    if f is None:
+        break
+    if f[0] == 0x10:
+        kinds.append("welcome" if b"Welcome back" in f[1] else ("notice" if b"dropped" in f[1] else "system"))
+    elif f[0] == 0x17:
+        if not kinds or kinds[-1] != "chat":
+            kinds.append("chat")
+print("resume-order", " ".join(kinds[:3]))
+PY
+expect "a maximum-size message is accepted" "$TMP/roomfix.out" "max-message-sent True"
+expect "a maximum-size message fits in HISTORY" "$TMP/roomfix.out" "max-message-in-history 1"
+expect "a recreated room has no old history" "$TMP/roomfix.out" "recreated-room-history 0"
+expect "resume sends welcome, drop notice, then backlog" "$TMP/roomfix.out" "resume-order welcome notice chat"
 
 stop_server main
 
