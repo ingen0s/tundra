@@ -52,10 +52,18 @@ static void (*stop_cb)(void);
 static void (*reload_cb)(void);
 
 #ifdef _WIN32
+static HANDLE cleanup_done = NULL;
+
 static BOOL WINAPI console_handler(DWORD type) {
-    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT ||
-        type == CTRL_SHUTDOWN_EVENT) {
+    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT) {
         if (stop_cb) stop_cb();
+        return TRUE;
+    }
+    if (type == CTRL_CLOSE_EVENT || type == CTRL_SHUTDOWN_EVENT) {
+        /* Windows ends the process as soon as this returns: wait (within
+         * the ~5 s the OS allows) for main to finish shutting down */
+        if (stop_cb) stop_cb();
+        if (cleanup_done) WaitForSingleObject(cleanup_done, 4500);
         return TRUE;
     }
     return FALSE;
@@ -73,7 +81,12 @@ void plat_cleanup(void) {
 void plat_handle_signals(void (*on_stop)(void), void (*on_reload)(void)) {
     stop_cb = on_stop;
     reload_cb = on_reload; /* no SIGHUP on Windows */
+    if (!cleanup_done) cleanup_done = CreateEventA(NULL, TRUE, FALSE, NULL);
     SetConsoleCtrlHandler(console_handler, TRUE);
+}
+
+void plat_shutdown_complete(void) {
+    if (cleanup_done) SetEvent(cleanup_done);
 }
 #else
 static void on_signal(int sig) {
@@ -90,6 +103,8 @@ int plat_init(void) {
 }
 
 void plat_cleanup(void) {}
+
+void plat_shutdown_complete(void) {}
 
 void plat_handle_signals(void (*on_stop)(void), void (*on_reload)(void)) {
     stop_cb = on_stop;
@@ -376,8 +391,10 @@ int poller_wait(Poller *p, PollEvent *out, int max, int timeout_ms) {
         out[i].ptr = evs[i].udata;
         out[i].readable = evs[i].filter == EVFILT_READ;
         out[i].writable = evs[i].filter == EVFILT_WRITE;
-        out[i].error = (evs[i].flags & EV_ERROR) != 0 ||
-                       ((evs[i].flags & EV_EOF) && evs[i].filter == EVFILT_WRITE);
+        /* EOF alone is left to the read path, which still drains any data
+         * the peer sent before closing; only a socket error (fflags) or
+         * EV_ERROR is reported as an error */
+        out[i].error = (evs[i].flags & EV_ERROR) != 0 || ((evs[i].flags & EV_EOF) && evs[i].fflags != 0);
     }
     return n;
 }
@@ -405,6 +422,7 @@ struct Poller {
     void **ptrs;
     size_t count;
     size_t cap;
+    size_t next;    /* where the next scan of ready sockets starts (fairness) */
 };
 
 Poller *poller_create(void) {
@@ -478,8 +496,13 @@ int poller_wait(Poller *p, PollEvent *out, int max, int timeout_ms) {
         return errno == EINTR ? 0 : -1;
 #endif
     }
+    /* Scan round-robin from where the last batch stopped, so with more
+     * ready sockets than `max` every one is still served in turn. */
     int n = 0;
-    for (size_t i = 0; i < p->count && n < max; i++) {
+    size_t start = p->next < p->count ? p->next : 0;
+    size_t k = 0;
+    for (; k < p->count && n < max; k++) {
+        size_t i = (start + k) % p->count;
         short re = p->fds[i].revents;
         if (!re) continue;
         out[n].ptr = p->ptrs[i];
@@ -488,6 +511,7 @@ int poller_wait(Poller *p, PollEvent *out, int max, int timeout_ms) {
         out[n].error = (re & (POLLERR | POLLNVAL)) != 0;
         n++;
     }
+    p->next = (start + k) % (p->count ? p->count : 1);
     return n;
 }
 

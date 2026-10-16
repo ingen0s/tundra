@@ -14,7 +14,9 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -146,11 +148,72 @@ def main():
 
     asyncio.run(sdk_checks(port))
 
+    # session ids are random version-4 UUIDs (the built-in generator)
+    u = uuid.UUID(bytes=bytes(sid))
+    check("session id is a v4 UUID", u.version == 4 and u.variant == uuid.RFC_4122)
+
+    # many clients at once: more ready sockets than one poll batch
+    many = []
+    for i in range(120):
+        m = Conn(port)
+        m.send(register(b"many%03d" % i))
+        many.append(m)
+    ok = sum(1 for m in many if m.wait_for(0x10, 5.0) is not None)
+    check("120 concurrent clients register", ok == 120)
+    for m in many:
+        m.send(frame(0x06, s8(b"#crowd")))
+    ok = sum(1 for m in many if m.wait_for(0x1A, 5.0) is not None)
+    check("120 concurrent clients join a room", ok == 120)
+    time.sleep(0.3)
+    many[0].send(frame(0x08, bytes([0]) + s8(b"#crowd") + s16(b"to everyone")))
+    got = [None] * len(many)
+
+    def recv_one(i):
+        f = many[i].wait_for(0x17, 5.0)
+        got[i] = f is not None and chat_text(f[1]) == "to everyone"
+    ts = [threading.Thread(target=recv_one, args=(i,)) for i in range(1, len(many))]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    check("a room message fans out to 119 members", all(got[1:]))
+    for m in many:
+        m.sock.close()
+
+    # a slow reader with a large backlog: the server queues and paces it
+    slow = Conn(port)
+    slow.send(register(b"slowpoke"))
+    slow.wait_for(0x10)
+    slow.send(frame(0x06, s8(b"#flood")))
+    slow.wait_for(0x1A)
+    fast = Conn(port)
+    fast.send(register(b"flooder"))
+    fast.wait_for(0x10)
+    fast.send(frame(0x06, s8(b"#flood")))
+    fast.wait_for(0x1A)
+    time.sleep(0.2)
+    big = b"x" * 4000
+    burst = b"".join(frame(0x08, bytes([0]) + s8(b"#flood") + s16(big + b"%04d" % i)) for i in range(400))
+    fast.send(burst)
+    time.sleep(1.0)  # let the slow reader's queue build up
+    n = 0
+    while True:
+        f = slow.wait_for(0x17, 3.0)
+        if f is None:
+            break
+        if chat_text(f[1]).endswith("%04d" % n):
+            n += 1
+        time.sleep(0.001)
+    check("a slow reader drains a 1.6 MB backlog in order", n == 400)
+    slow.sock.close()
+    fast.sock.close()
+
     for c in (a, b, w):
         c.sock.close()
     code, err = stop(proc)
     check("clean shutdown", code == 0)
-    if code != 0:
+    check("no failures logged", "failed" not in err.lower())
+    if code != 0 or "failed" in err.lower():
         print(err)
 
     # persistence across a restart

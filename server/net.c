@@ -1,3 +1,4 @@
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,7 +12,8 @@ Client clients[MAX_CLIENTS];
 static Poller *poller = NULL;
 static tsock_t server_sock = TSOCK_INVALID;
 static tsock_t ws_sock = TSOCK_INVALID;
-static volatile int running = 1;
+/* set from a signal handler (POSIX) or a console-handler thread (Windows) */
+static atomic_int running = 1;
 static int listen_marker;    /* poller ptr for the Tundra listener */
 static int ws_listen_marker; /* poller ptr for the HTTP/WebSocket listener */
 

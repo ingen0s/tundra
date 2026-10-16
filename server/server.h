@@ -137,9 +137,9 @@ int valid_room_name(const uint8_t *name, size_t len);
 int net_listen(int port);
 int net_listen_ws(int port);               /* optional HTTP/WebSocket listener */
 void out_append(Client *c, const uint8_t *data, size_t len); /* raw bytes, then flush */
-void net_run(void (*tick)(void));
+void net_run(void (*tick)(void));                          /* event loop; returns on shutdown */
 /* Ctrl+C / SIGINT / SIGTERM stop net_run; SIGHUP calls on_reload (POSIX). */
-void net_handle_signals(void (*on_reload)(void));          /* event loop; returns on shutdown */
+void net_handle_signals(void (*on_reload)(void));
 void net_shutdown(void);
 void mark_dead(Client *c);
 void close_after_flush(Client *c);
