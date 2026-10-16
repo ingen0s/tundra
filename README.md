@@ -4,7 +4,7 @@ A small, fast chat server in C with a compact binary protocol. Rooms, direct mes
 
 ## Status
 
-Early but tested. The server is single-threaded and event-driven (epoll on Linux, kqueue on macOS, WSAPoll on Windows), handles up to 1,000 connections, and runs natively on all three. Every change runs through unit tests, end-to-end tests, AddressSanitizer/UBSan, a fuzzer, and build-and-test jobs on Linux, macOS and Windows in CI. There is no built-in TLS yet, so on untrusted networks put it behind a TLS-terminating proxy.
+Early but tested. The server is single-threaded and event-driven (epoll on Linux, kqueue on macOS, WSAPoll on Windows), handles up to 1,000 connections, and runs natively on all three. Every change runs through unit tests, end-to-end tests, AddressSanitizer/UBSan, a fuzzer, and build-and-test jobs on Linux, macOS and Windows in CI. TLS is built in (OpenSSL) for both the Tundra port and the web port.
 
 ## Features
 
@@ -22,13 +22,15 @@ Early but tested. The server is single-threaded and event-driven (epoll on Linux
 
 ## Quick start
 
-Build (the only dependency is SQLite):
+Build (SQLite is required; OpenSSL is optional and turns on TLS):
 
 | Platform | Steps |
 |----------|-------|
-| Linux | `sudo apt-get install libsqlite3-dev`, then `make` |
-| macOS | `xcode-select --install` (SQLite ships with macOS), then `make` |
-| Windows | Install [MSYS2](https://www.msys2.org/), open the **MINGW64** shell, `pacman -S make mingw-w64-x86_64-gcc mingw-w64-x86_64-sqlite3`, then `make` (binaries end in `.exe`) |
+| Linux | `sudo apt-get install libsqlite3-dev libssl-dev`, then `make` |
+| macOS | `xcode-select --install` (SQLite ships with macOS); for TLS `brew install openssl@3 pkg-config` and build with `PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig" make`, otherwise just `make` |
+| Windows | Install [MSYS2](https://www.msys2.org/), open the **MINGW64** shell, `pacman -S make mingw-w64-x86_64-gcc mingw-w64-x86_64-sqlite3 mingw-w64-x86_64-openssl mingw-w64-x86_64-pkgconf`, then `make` (binaries end in `.exe`) |
+
+The build finds OpenSSL through `pkg-config`; `make TLS=0` leaves TLS out.
 
 Run:
 
@@ -36,6 +38,7 @@ Run:
 ./build/tundra_chat_server            # listens on 4242
 ./build/tundra_chat_server -w 8080    # also serves the web client at http://localhost:8080/
 ./build/tundra_chat_server -d chat.db -t tokens.txt   # with persistence and token auth
+./build/tundra_chat_server -w 8443 -C cert.pem -K key.pem   # TLS on both ports (https/wss on 8443)
 ```
 
 In two more terminals:
@@ -64,6 +67,7 @@ An agent and a client that uses it:
 | `-f id` | with `-r`: replay everything after this message id |
 | `-a` | acknowledge every chat message received |
 | `-k token` | authentication token for this username |
+| `-s` / `-x` | connect with TLS / skip certificate verification (testing only) |
 | `-G caps` | advertise as an agent with these capabilities |
 | `-q agent:body` | send an agent request |
 | `-Q` | list agents |
@@ -95,6 +99,8 @@ async def main():
 
 asyncio.run(main())
 ```
+
+For a TLS server pass `ssl=True` (system trust store) or an `ssl.SSLContext`, for example `tundra.Client(host, 4242, "alice", ssl=True)`.
 
 Writing an agent is a handler; `yield` streams partial answers:
 
@@ -146,6 +152,7 @@ Server options:
 |--------|---------|
 | `-p port` | listen port (default 4242) |
 | `-w port` | also serve the web client and WebSockets on this HTTP port |
+| `-C file` / `-K file` | TLS certificate chain and private key (PEM); together they turn on TLS for both ports, so the web port serves `https://` and `wss://` |
 | `-d file` | store messages in this SQLite database |
 | `-t file` | tokens file, one `username token` per line; keep it private (`chmod 600`) |
 | `-A` | with `-t`: every username must be listed |
@@ -171,7 +178,6 @@ Compile-time constants in `server/server.h` (two have command-line overrides):
 
 ## Roadmap
 
-- Built-in TLS (today: put a TLS-terminating proxy in front)
 - Persisting sessions and room membership across restarts (messages already persist with `-d`)
 - SDKs for more languages
 
