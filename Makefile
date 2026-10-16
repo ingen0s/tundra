@@ -1,6 +1,8 @@
 CC      ?= cc
 CFLAGS  ?= -O2 -g
-CFLAGS  += -std=c11 -Wall -Wextra -Wshadow -Wformat=2 -Werror
+# Required flags are appended with `override` so `make CFLAGS=...` cannot drop them.
+override CFLAGS += -std=c11 -Wall -Wextra -Wshadow -Wformat=2 -Werror $(SANFLAGS)
+SANITIZE := -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all
 LDLIBS  += -luuid
 
 BUILD   := build
@@ -24,7 +26,7 @@ $(CLIENT): test_client.c $(HEADERS) | $(BUILD)
 # Build with AddressSanitizer and UndefinedBehaviorSanitizer.
 asan:
 	$(MAKE) clean
-	$(MAKE) all CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined"
+	$(MAKE) all CFLAGS="-O1 -g" SANFLAGS="$(SANITIZE)"
 
 test: all
 	./tests/integration.sh
