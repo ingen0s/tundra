@@ -587,6 +587,92 @@ expect "a reused name gets no direct messages meant for its earlier holder" "$TM
 expect "catch-up skips room messages from before the join" "$TMP/catchup2.out" "joiner-replay ['after you joined']"
 expect "a RESUME_FROM that is not 8 bytes is refused" "$TMP/catchup2.out" "bad-resume-from 2"
 stop_server catchup
+# 20. token authentication
+PORT=$((BASE_PORT + 2))
+printf '# test tokens\nalice s3cret\nbot1 t0k\n' >"$TMP/tokens"
+start_server auth "$PORT" -t "$TMP/tokens"
+client -u alice -w 0.2 >"$TMP/auth1.out"
+expect "listed name without a token is refused" "$TMP/auth1.out" "ERROR 9 "
+client -u alice -k wrong -w 0.2 >"$TMP/auth2.out"
+expect "wrong token is refused" "$TMP/auth2.out" "ERROR 9 "
+client -u alice -k s3cret -w 0.2 >"$TMP/auth3.out"
+expect "right token is accepted" "$TMP/auth3.out" "SYSTEM Welcome, alice!"
+client -u bob -w 0.2 >"$TMP/auth4.out"
+expect "unlisted names stay open without -A" "$TMP/auth4.out" "SYSTEM Welcome, bob!"
+client -u carl -k newtok -w 0.2 >"$TMP/auth5.out"
+expect "unlisted name with a token is still accepted" "$TMP/auth5.out" "SYSTEM Welcome, carl!"
+printf 'dora d0ra\n' >>"$TMP/tokens"
+kill -HUP "$auth_PID"
+wait_line "$TMP/auth.log" "3 user(s) loaded"
+client -u dora -w 0.2 >"$TMP/auth6.out"
+expect "tokens file is re-read on SIGHUP" "$TMP/auth6.out" "ERROR 9 "
+stop_server auth
+
+PORT=$((BASE_PORT + 3))
+start_server authall "$PORT" -t "$TMP/tokens" -A
+client -u erin -w 0.2 >"$TMP/auth7.out"
+expect "-A refuses unlisted names" "$TMP/auth7.out" "ERROR 9 "
+client -u bot1 -k t0k -w 0.2 >"$TMP/auth8.out"
+expect "-A accepts listed names with their token" "$TMP/auth8.out" "SYSTEM Welcome, bot1!"
+stop_server authall
+
+# 21. persistence: history and ids survive a restart
+PORT=$((BASE_PORT + 4))
+start_server store1 "$PORT" -d "$TMP/chat.db"
+client -u fay -j "#keep" -t "#keep" -m "one" -m "two" -m "three" -w 0.3 >"$TMP/store1.out"
+last_id=$(awk '/^SENT/{id=$2} END{print id}' "$TMP/store1.out")
+stop_server store1
+start_server store2 "$PORT" -d "$TMP/chat.db"
+expect "stored messages are loaded on start" "$TMP/store2.log" "loaded 3 recent message(s)"
+client -u gus -j "#keep" -y "#keep" -t "#keep" -m "four" -w 0.3 >"$TMP/store2.out"
+if grep '^HIST ' "$TMP/store2.out" | awk '{print $5}' | tr '\n' ' ' | grep -qx 'one two three '; then
+    pass "history survives a restart"
+else
+    fail "history survives a restart"; sed 's/^/       /' "$TMP/store2.out"
+fi
+new_id=$(awk '/^SENT/{print $2}' "$TMP/store2.out")
+if [ -n "$new_id" ] && [ -n "$last_id" ] && [ "$new_id" -eq $((last_id + 1)) ]; then
+    pass "message ids continue after a restart"
+else
+    fail "message ids continue after a restart ($last_id then $new_id)"
+fi
+# paging back with before_id
+raw >"$TMP/page.out" <<'PY2'
+import sys, struct
+from tundra_raw import *
+c = Conn(int(sys.argv[1]))
+c.send(register(b"hal"))
+c.wait_for(0x10)
+c.send(frame(0x06, s8(b"#keep")))
+c.wait_for(0x1A)
+c.send(frame(0x0B, s8(b"#keep") + struct.pack(">QH", 0, 2)))
+f = c.wait_for(0x1B)
+n = struct.unpack(">H", f[1][6:8])[0]
+p = f[1][8:]
+texts = []
+oldest = None
+for _ in range(n):
+    ln = struct.unpack(">H", p[:2])[0]; e = p[2:2 + ln]; p = p[2 + ln:]
+    mid = struct.unpack(">Q", e[:8])[0]
+    oldest = mid if oldest is None else min(oldest, mid)
+    texts.append(e)
+def text(e):
+    # CHAT payload: id(8) ts(8) kind(1) target(str8) sender(str8) text(str16)
+    tl = e[17]; sl = e[18 + tl]; ml = struct.unpack(">H", e[19 + tl + sl:21 + tl + sl])[0]
+    return e[21 + tl + sl:21 + tl + sl + ml].decode()
+print("page1", " ".join(text(e) for e in texts))
+c.send(frame(0x0B, s8(b"#keep") + struct.pack(">QH", oldest, 2)))
+f = c.wait_for(0x1B)
+n = struct.unpack(">H", f[1][6:8])[0]
+p = f[1][8:]
+texts = []
+for _ in range(n):
+    ln = struct.unpack(">H", p[:2])[0]; texts.append(p[2:2 + ln]); p = p[2 + ln:]
+print("page2", " ".join(text(e) for e in texts))
+PY2
+expect "history pages newest first" "$TMP/page.out" "page1 three four"
+expect "before_id pages further back" "$TMP/page.out" "page2 one two"
+stop_server store2
 
 if [ "$FAILED" -ne 0 ]; then
     for log in "$TMP"/*.log; do echo "--- $(basename "$log") ---"; tail -40 "$log"; done

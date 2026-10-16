@@ -32,22 +32,28 @@ static void copy_name(char *dst, size_t cap, TundraBytes src) {
     dst[n] = '\0';
 }
 
-const LoggedMessage *msglog_append(uint8_t kind, TundraBytes target, const char *sender, TundraBytes text) {
+static LoggedMessage *insert(uint64_t id, uint64_t ts_ms, uint8_t kind, TundraBytes target, const char *sender,
+                             TundraBytes text) {
     uint8_t *copy = malloc(text.len ? text.len : 1);
     if (!copy) return NULL;
     if (text.len) memcpy(copy, text.p, text.len);
 
+    if (id > next_id) {
+        /* restored ids can skip (e.g. a failed insert); the log stays dense */
+        while (first_id < next_id) evict_oldest();
+        first_id = next_id = id;
+    }
     /* make room: by count (the slot we are about to reuse) and by bytes */
     while (first_id < next_id &&
            (next_id - first_id >= MSGLOG_CAPACITY || total_bytes + text.len > MSGLOG_MAX_BYTES)) {
         evict_oldest();
     }
 
-    uint64_t id = next_id++;
+    next_id = id + 1;
     LoggedMessage *m = slot(id);
     memset(m, 0, sizeof(*m));
     m->id = id;
-    m->ts_ms = wall_ms();
+    m->ts_ms = ts_ms;
     m->kind = kind;
     copy_name(m->target, sizeof(m->target), target);
     strncpy(m->sender, sender, sizeof(m->sender) - 1);
@@ -55,6 +61,17 @@ const LoggedMessage *msglog_append(uint8_t kind, TundraBytes target, const char 
     m->text_len = text.len;
     total_bytes += text.len;
     return m;
+}
+
+const LoggedMessage *msglog_append(uint8_t kind, TundraBytes target, const char *sender, TundraBytes text) {
+    LoggedMessage *m = insert(next_id, wall_ms(), kind, target, sender, text);
+    if (m) store_append(m);
+    return m;
+}
+
+int msglog_restore(uint64_t id, uint64_t ts_ms, uint8_t kind, TundraBytes target, const char *sender, TundraBytes text) {
+    if (id < next_id || id == 0) return -1;
+    return insert(id, ts_ms, kind, target, sender, text) ? 0 : -1;
 }
 
 const LoggedMessage *msglog_get(uint64_t id) {

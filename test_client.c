@@ -15,6 +15,7 @@
  * Options:
  *   -f id         with -r: resume from this message id instead of the server's watermark
  *   -a            acknowledge every CHAT received
+ *   -k token      authentication token for this username
  * Then everything received is printed for -w seconds (default 1). PINGs are
  * answered automatically.
  *
@@ -282,7 +283,7 @@ static int run_action(const Action *a) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "usage: %s -u username [-H host] [-p port] [-r session-id [-f last-id]] [-a]\n"
+            "usage: %s -u username [-H host] [-p port] [-k token] [-r session-id [-f last-id]] [-a]\n"
             "          [-j #room] [-L #room] [-t target] [-m text] [-R] [-W #room] [-y #room] [-c]\n"
             "          [-w seconds]\n",
             prog);
@@ -294,13 +295,14 @@ int main(int argc, char **argv) {
     const char *user = NULL;
     const char *resume = NULL;
     const char *resume_from = NULL;
+    const char *token = NULL;
     const char *target = "#lobby";
     Action actions[MAX_ACTIONS];
     int nactions = 0;
     double wait_s = 1.0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "H:p:u:r:f:aj:L:t:m:RW:y:cw:h")) != -1) {
+    while ((opt = getopt(argc, argv, "H:p:u:r:f:ak:j:L:t:m:RW:y:cw:h")) != -1) {
         switch (opt) {
             case 'H': host = optarg; break;
             case 'p': port = optarg; break;
@@ -308,6 +310,7 @@ int main(int argc, char **argv) {
             case 'r': resume = optarg; break;
             case 'f': resume_from = optarg; break;
             case 'a': auto_ack = 1; break;
+            case 'k': token = optarg; break;
             case 't': target = optarg; break;
             case 'w': wait_s = atof(optarg); break;
             case 'j': case 'L': case 'm': case 'R': case 'W': case 'y': case 'c':
@@ -334,15 +337,20 @@ int main(int argc, char **argv) {
         fprintf(stderr, "invalid session id: %s\n", resume);
         return 2;
     }
-    uint8_t ext[16];
+    uint8_t ext[512];
+    TundraWriter xw = tundra_writer(ext, sizeof(ext));
     if (resume_from) {
         uint8_t v[8];
         tundra_put_u64(v, strtoull(resume_from, NULL, 10));
-        TundraWriter w = tundra_writer(ext, sizeof(ext));
-        tundra_wr_tlv(&w, REG_RESUME_FROM, v, sizeof(v));
-        reg.u.reg.ext.p = ext;
-        reg.u.reg.ext.len = w.len;
+        tundra_wr_tlv(&xw, REG_RESUME_FROM, v, sizeof(v));
     }
+    if (token) tundra_wr_tlv(&xw, REG_TOKEN, token, strlen(token));
+    if (!xw.ok) {
+        fprintf(stderr, "token too long\n");
+        return 2;
+    }
+    reg.u.reg.ext.p = ext;
+    reg.u.reg.ext.len = xw.len;
 
     sock = connect_to(host, port);
     if (sock < 0) {

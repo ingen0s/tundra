@@ -181,7 +181,31 @@ const LoggedMessage *msglog_get(uint64_t id);   /* NULL if never assigned or evi
 uint64_t msglog_last_id(void);
 uint64_t msglog_first_id(void);  /* oldest id still held (last_id + 1 when empty) */
 void msglog_to_chat(const LoggedMessage *m, TundraMsg *out);
+/* Re-inserts a stored message at startup; ids must be increasing. 0 on success. */
+int msglog_restore(uint64_t id, uint64_t ts_ms, uint8_t kind, TundraBytes target, const char *sender, TundraBytes text);
 void msglog_free(void);
+
+/* ---- auth.c ---- */
+extern int auth_require_all;
+int auth_init(const char *path);   /* 0 on success */
+void auth_reload(void);
+void auth_free(void);
+int auth_enabled(void);
+/* 1 if `username` may register with `token` (NULL when none was sent). */
+int auth_check(const char *username, const TundraBytes *token);
+
+/* ---- store.c ---- */
+int store_open(const char *path);  /* 0 on success; loads recent messages */
+void store_close(void);
+int store_enabled(void);
+void store_append(const LoggedMessage *m);
+/* Room deletions are remembered so a recreated room starts with an empty
+ * history, across restarts too. */
+void store_room_deleted(const char *room, uint64_t last_id);
+uint64_t store_room_floor(const char *room); /* first message id the room may show */
+/* Room history before `before_id` (0 = latest), newest first. Fills `out`
+ * with up to `limit` messages whose text the caller must free. */
+size_t store_history(const char *room, uint64_t before_id, size_t limit, LoggedMessage *out);
 
 /* ---- handlers.c ---- */
 void handle_frame(Client *c, const uint8_t *frame, size_t payload_len);

@@ -29,9 +29,12 @@ Room *room_get_or_create(TundraBytes name) {
             r = &rooms[i];
             memset(r, 0, sizeof(*r));
             r->used = 1;
-            r->first_msg_id = msglog_last_id() + 1;
             memcpy(r->name, name.p, name.len);
             r->name[name.len] = '\0';
+            /* Without a database a new room can only see messages sent from
+             * now on. With one, history survives restarts, so only an
+             * explicit earlier deletion of this name hides older messages. */
+            r->first_msg_id = store_enabled() ? store_room_floor(r->name) : msglog_last_id() + 1;
             return r;
         }
     }
@@ -68,7 +71,10 @@ void room_remove(Room *r, Session *s) {
     int i = session_index(s);
     r->members[i / 8] &= (uint8_t)~(1u << (i % 8));
     r->member_count--;
-    if (r->member_count == 0 && strcmp(r->name, LOBBY) != 0) r->used = 0;
+    if (r->member_count == 0 && strcmp(r->name, LOBBY) != 0) {
+        r->used = 0;
+        store_room_deleted(r->name, msglog_last_id());
+    }
 }
 
 void room_deliver(Room *r, const Session *skip, uint8_t type, const uint8_t *payload, size_t len) {
