@@ -51,9 +51,14 @@ int room_is_member(const Room *r, const Session *s) {
     return (r->members[i / 8] >> (i % 8)) & 1;
 }
 
+uint64_t room_joined_after(const Room *r, const Session *s) {
+    return r->joined_after[session_index(s)];
+}
+
 void room_add(Room *r, Session *s) {
     if (room_is_member(r, s)) return;
     int i = session_index(s);
+    r->joined_after[i] = msglog_last_id();
     r->members[i / 8] |= (uint8_t)(1u << (i % 8));
     r->member_count++;
 }

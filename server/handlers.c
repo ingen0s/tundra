@@ -39,21 +39,40 @@ static void handle_register(Client *c, uint16_t seq, const TundraMsg *m) {
             /* the old connection is still attached (e.g. half-open); replace it */
             mark_dead(s->client);
         }
-        /* hold the replay until the welcome and any drop notice are out */
+        TundraBytes v;
+        int has_from = tundra_reg_find(m->u.reg.ext, REG_RESUME_FROM, &v);
+        if (has_from && v.len != 8) {
+            send_error(c, seq, ERR_INVALID_FORMAT, "RESUME_FROM must be 8 bytes");
+            return;
+        }
+        /* hold the replay until the welcome and any notices are out */
         s->pumping = 1;
         attach(s, c);
         char msg[96];
         snprintf(msg, sizeof(msg), "Welcome back, %s!", username);
         send_system(c, seq, s->id, msg);
         if (s->backlog_dropped) {
-            snprintf(msg, sizeof(msg), "%u buffered message(s) were dropped while you were away",
+            snprintf(msg, sizeof(msg), "%u buffered event(s) were dropped while you were away",
                      s->backlog_dropped);
             send_system(c, seq, nil_uuid, msg);
             s->backlog_dropped = 0;
         }
+
+        /* Catch up from what the client says it has, else from its last
+         * ACK, else from what was fully written to the old connection. */
+        uint64_t from;
+        if (has_from) from = tundra_get_u64(v.p);
+        else if (s->has_acked) from = s->acked_id;
+        else from = s->written_id;
+        if (from > msglog_last_id()) from = msglog_last_id();
+        if (from < s->start_id) from = s->start_id; /* nothing from before the session existed */
+
+        if (chat_replay_start(s, from)) {
+            send_system(c, seq, nil_uuid, "Some earlier messages are no longer available");
+        }
         s->pumping = 0;
-        backlog_pump(s);
-        log_info("%s resumed session", username);
+        session_pump(s);
+        log_info("%s resumed session, catching up after message %llu", username, (unsigned long long)from);
         return;
     }
 
@@ -70,6 +89,7 @@ static void handle_register(Client *c, uint16_t seq, const TundraMsg *m) {
         return;
     }
     uuid_generate(s->id);
+    s->start_id = s->written_id = msglog_last_id();
     memcpy(s->username, username, uname.len + 1);
     s->connected_at = mono_s();
     attach(s, c);
@@ -318,6 +338,13 @@ static void handle_agent_command(Client *c, uint16_t seq, const TundraMsg *m) {
 
 /* ---- misc ---- */
 
+static void handle_ack(Client *c, uint64_t id) {
+    Session *s = c->session;
+    if (id > msglog_last_id()) id = msglog_last_id(); /* cannot ack the future */
+    if (!s->has_acked || id > s->acked_id) s->acked_id = id;
+    s->has_acked = 1;
+}
+
 /* Latency is computed from the timestamp the client echoes back, so a
  * late answer to an old ping cannot produce a low reading. */
 static void handle_pong(Client *c, TundraBytes data) {
@@ -388,6 +415,7 @@ void handle_frame(Client *c, const uint8_t *frame, size_t payload_len) {
         case MSG_WHO:           handle_who(c, seq, m.u.room.room); break;
         case MSG_HISTORY:       handle_history(c, seq, &m); break;
         case MSG_AGENT_COMMAND: handle_agent_command(c, seq, &m); break;
+        case MSG_ACK:           handle_ack(c, m.u.sent.id); break;
         case MSG_PONG:          handle_pong(c, m.u.pong.data); break;
         case MSG_HEALTH_CHECK:  handle_health_check(c, seq); break;
         default:                send_error(c, seq, ERR_INVALID_FORMAT, "Unknown message type"); break;

@@ -67,6 +67,40 @@ int tundra_next_history(TundraReader *it, TundraMsg *chat) {
     return read_chat(&sub, chat) && tundra_rd_done(&sub);
 }
 
+/* ---- REGISTER extensions ---- */
+
+static int tlv_valid(TundraBytes ext) {
+    TundraReader r = tundra_reader(ext.p, ext.len);
+    while (r.ok && r.pos < r.len) {
+        (void)tundra_rd_u8(&r);
+        uint16_t n = tundra_rd_u16(&r);
+        (void)tundra_rd_bytes(&r, n);
+    }
+    return r.ok;
+}
+
+int tundra_reg_find(TundraBytes ext, uint8_t tag, TundraBytes *value) {
+    TundraReader r = tundra_reader(ext.p, ext.len);
+    while (r.ok && r.pos < r.len) {
+        uint8_t t = tundra_rd_u8(&r);
+        uint16_t n = tundra_rd_u16(&r);
+        const uint8_t *v = tundra_rd_bytes(&r, n);
+        if (r.ok && t == tag) {
+            value->p = v;
+            value->len = n;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void tundra_wr_tlv(TundraWriter *w, uint8_t tag, const void *value, size_t len) {
+    if (len > 0xFFFF) { w->ok = 0; return; }
+    tundra_wr_u8(w, tag);
+    tundra_wr_u16(w, (uint16_t)len);
+    tundra_wr_bytes(w, value, len);
+}
+
 /* Reads `count` list entries, validating each, and records their span. */
 static void read_list(TundraReader *r, uint8_t type, uint16_t count, TundraBytes *entries) {
     size_t start = r->pos;
@@ -124,6 +158,7 @@ int tundra_decode(uint8_t type, const uint8_t *payload, size_t len, TundraMsg *o
             (void)read_chat(&r, out);
             break;
         case MSG_SENT:
+        case MSG_ACK:
             out->u.sent.id = tundra_rd_u64(&r);
             break;
         case MSG_ROOM_EVENT:
@@ -145,6 +180,12 @@ int tundra_decode(uint8_t type, const uint8_t *payload, size_t len, TundraMsg *o
             const uint8_t *id = tundra_rd_bytes(&r, TUNDRA_UUID_LEN);
             if (id) memcpy(out->u.reg.id, id, TUNDRA_UUID_LEN);
             out->u.reg.username = rd_str8(&r);
+            if (r.ok) {
+                out->u.reg.ext.p = r.p + r.pos;
+                out->u.reg.ext.len = r.len - r.pos;
+                if (!tlv_valid(out->u.reg.ext)) r.ok = 0;
+                r.pos = r.len;
+            }
             break;
         }
         case MSG_MESSAGE:
@@ -251,6 +292,7 @@ long tundra_encode(const TundraMsg *m, uint8_t *buf, size_t cap) {
             write_chat(&w, m);
             break;
         case MSG_SENT:
+        case MSG_ACK:
             tundra_wr_u64(&w, m->u.sent.id);
             break;
         case MSG_ROOM_EVENT:
@@ -271,6 +313,8 @@ long tundra_encode(const TundraMsg *m, uint8_t *buf, size_t cap) {
         case MSG_REGISTER:
             tundra_wr_bytes(&w, m->u.reg.id, TUNDRA_UUID_LEN);
             wr_str8(&w, m->u.reg.username);
+            if (!tlv_valid(m->u.reg.ext)) w.ok = 0;
+            tundra_wr_bytes(&w, m->u.reg.ext.p, m->u.reg.ext.len);
             break;
         case MSG_MESSAGE:
             wr_str16(&w, m->u.message.text);
@@ -334,6 +378,7 @@ const char *tundra_type_name(uint8_t type) {
         case MSG_LEAVE:             return "LEAVE";
         case MSG_SEND:              return "SEND";
         case MSG_LIST_ROOMS:        return "LIST_ROOMS";
+        case MSG_ACK:               return "ACK";
         case MSG_HISTORY:           return "HISTORY";
         case MSG_WHO:               return "WHO";
         case MSG_CHAT:              return "CHAT";

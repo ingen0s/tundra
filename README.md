@@ -12,7 +12,7 @@ Early but tested. The server is single-threaded on Linux epoll, handles up to 1,
 - **Rooms:** join, leave, list, who's here. Everyone starts in `#lobby`.
 - **Direct messages** between users.
 - **Message ids and history:** every message gets a server-assigned id; the most recent 10,000 are kept in memory and can be paged with `HISTORY`.
-- **Session resume:** a dropped connection keeps its name and rooms for 2 minutes; reconnecting with the session id delivers what was missed (up to 50 messages / 1 MiB, paced so a large catch-up never overflows the connection).
+- **Session resume with exact catch-up:** a dropped connection keeps its name and rooms for 2 minutes. Reconnecting replays every message it missed from the server's log, starting after the client's last `ACK`, an explicit resume point, or what the server knows it wrote, paced so a long catch-up never overflows the connection.
 - **Health:** ping/pong latency and per-session counters via `HEALTH_CHECK`.
 - **Backpressure:** each client's outgoing queue is capped at 1 MiB; clients that can't keep up are disconnected instead of stalling the server.
 
@@ -40,6 +40,8 @@ In two more terminals:
 | `-u name` | username (required) |
 | `-H host`, `-p port` | server address (default `127.0.0.1:4242`) |
 | `-r id` | resume a session with the id from a previous `SESSION` line |
+| `-f id` | with `-r`: replay everything after this message id |
+| `-a` | acknowledge every chat message received |
 | `-j #room` / `-L #room` | join / leave a room |
 | `-t target` | target for following `-m`: a `#room` or a username (default `#lobby`) |
 | `-m text` | send a message |
@@ -83,14 +85,13 @@ Compile-time constants in `server/server.h` (two have command-line overrides):
 | `DEFAULT_RESUME_GRACE` | 120 s | how long a disconnected session is held (`-g`) |
 | `REGISTER_TIMEOUT` | 10 s | time a new connection has to register |
 | `PING_INTERVAL` | 30 s | server pings |
-| `MAX_BUFFERED_MESSAGES` / `MAX_BACKLOG_BYTES` | 50 / 1 MiB | backlog per disconnected session |
+| `MAX_BUFFERED_MESSAGES` / `MAX_BACKLOG_BYTES` | 50 / 1 MiB | buffered non-chat frames per disconnected session |
 | `MAX_TOTAL_BACKLOG` | 64 MiB | all backlogs together |
 | `MAX_OUTBOUND_BYTES` | 1 MiB | outgoing queue per client |
 | `MSGLOG_CAPACITY` / `MSGLOG_MAX_BYTES` | 10,000 / 64 MiB | history kept in memory |
 
 ## Roadmap
 
-- Delivery ACKs and resume-from-last-seen-id (exact catch-up instead of a fixed backlog)
 - Token authentication and persistent history (SQLite)
 - Typed agent messaging: agents advertise capabilities, request/response with correlation ids
 - WebSocket gateway, browser client, Python SDK

@@ -124,24 +124,77 @@ static void backlog_push(Session *s, uint8_t type, const uint8_t *payload, size_
     f->type = type;
     f->payload = copy;
     f->len = len;
+    f->after_id = msglog_last_id();
     s->backlog_count++;
     s->backlog_bytes += len;
     total_backlog_bytes += len;
 }
 
-void backlog_pump(Session *s) {
+/* Would this session have received `m` while connected? Uses current room
+ * membership, which cannot change while a session is detached. */
+static int chat_visible_to(const LoggedMessage *m, const Session *s) {
+    if (strcmp(m->sender, s->username) == 0) return 0; /* own messages are confirmed with SENT */
+    if (m->id <= s->start_id) return 0; /* before this session existed */
+    if (m->kind == CHAT_DIRECT) return strcmp(m->target, s->username) == 0;
+    Room *r = room_find_cstr(m->target);
+    return r && room_is_member(r, s) && m->id > room_joined_after(r, s);
+}
+
+static int has_room(const Client *c, size_t next_len) {
+    return c->out_len == 0 || c->out_len + TUNDRA_HEADER_LEN + next_len <= REPLAY_HIGH_WATER;
+}
+
+int session_has_pending(const Session *s) {
+    return s->backlog_count > 0 || s->replay_next != 0;
+}
+
+void session_pump(Session *s) {
     if (s->pumping) return; /* re-entered via push_frame -> flush_client */
     s->pumping = 1;
-    while (s->backlog_count > 0 && s->state == SESSION_ACTIVE && s->client && !s->client->dead) {
-        Client *c = s->client;
-        if (c->out_len > 0 && c->out_len + TUNDRA_HEADER_LEN + backlog_at(s, 0)->len > REPLAY_HIGH_WATER) break;
-        BufferedFrame item = backlog_pop(s);
-        push_frame(c, item.type, item.payload, item.len);
-        free(item.payload);
+    static uint8_t buf[TUNDRA_MAX_PAYLOAD];
+
+    while (s->state == SESSION_ACTIVE && s->client && !s->client->dead) {
+        /* the log may have moved on while we were paused: say so, skip ahead */
+        if (s->replay_next != 0 && s->replay_next < msglog_first_id()) {
+            static const uuid_t nil = {0};
+            s->replay_next = msglog_first_id();
+            send_system(s->client, 0, nil, "Some earlier messages are no longer available");
+            continue;
+        }
+        if (s->replay_next != 0 && s->replay_next > msglog_last_id()) s->replay_next = 0; /* caught up */
+
+        /* a buffered event goes out once every chat before it has */
+        if (s->backlog_count > 0 && (s->replay_next == 0 || backlog_at(s, 0)->after_id < s->replay_next)) {
+            if (!has_room(s->client, backlog_at(s, 0)->len)) break;
+            BufferedFrame item = backlog_pop(s);
+            push_frame(s->client, item.type, item.payload, item.len);
+            free(item.payload);
+            continue;
+        }
+        if (s->replay_next == 0) break; /* nothing pending */
+
+        uint64_t id = s->replay_next;
+        const LoggedMessage *m = msglog_get(id);
+        if (!m || !chat_visible_to(m, s)) {
+            s->replay_next = id + 1;
+            continue;
+        }
+        TundraMsg chat;
+        msglog_to_chat(m, &chat);
+        long n = tundra_encode(&chat, buf, sizeof(buf));
+        if (n < 0) {
+            s->replay_next = id + 1;
+            continue;
+        }
+        if (!has_room(s->client, (size_t)n)) break;
+        s->replay_next = id + 1;
+        push_frame(s->client, MSG_CHAT, buf, (size_t)n);
     }
+
     s->pumping = 0;
     /* frames dropped while this session was online but behind */
-    if (s->backlog_count == 0 && s->backlog_dropped && s->state == SESSION_ACTIVE && s->client && !s->client->dead) {
+    if (!session_has_pending(s) && s->backlog_dropped && s->state == SESSION_ACTIVE && s->client &&
+        !s->client->dead) {
         static const uuid_t nil = {0};
         char msg[96];
         snprintf(msg, sizeof(msg), "%u message(s) were dropped because you fell behind", s->backlog_dropped);
@@ -150,12 +203,35 @@ void backlog_pump(Session *s) {
     }
 }
 
+int chat_replay_start(Session *s, uint64_t after_id) {
+    uint64_t first = msglog_first_id();
+    int gap = after_id + 1 < first;
+    uint64_t start = gap ? first : after_id + 1;
+    s->replay_next = start <= msglog_last_id() ? start : 0;
+    return gap;
+}
+
 void deliver(Session *s, uint8_t type, const uint8_t *payload, size_t len) {
-    if (s->state == SESSION_ACTIVE && s->client && s->backlog_count == 0) {
+    if (s->state == SESSION_FREE) return;
+    int online = s->state == SESSION_ACTIVE && s->client;
+
+    if (type == MSG_CHAT) {
+        if (online && !session_has_pending(s)) {
+            push_frame(s->client, type, payload, len);
+        } else if (online && s->replay_next == 0 && len >= 8) {
+            /* only buffered frames are pending: replay this chat after them */
+            s->replay_next = tundra_get_u64(payload);
+            session_pump(s);
+        }
+        /* detached, or a replay already in progress that will reach it */
+        return;
+    }
+
+    if (online && !session_has_pending(s)) {
         push_frame(s->client, type, payload, len);
-    } else if (s->state != SESSION_FREE) {
+    } else {
         backlog_push(s, type, payload, len);
-        if (s->state == SESSION_ACTIVE) backlog_pump(s);
+        if (online) session_pump(s);
     }
 }
 

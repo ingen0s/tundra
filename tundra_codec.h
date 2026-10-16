@@ -27,7 +27,11 @@ typedef struct {
 typedef struct {
     uint8_t type;
     union {
-        struct { uint8_t id[TUNDRA_UUID_LEN]; TundraBytes username; } reg;          /* REGISTER */
+        struct {
+            uint8_t id[TUNDRA_UUID_LEN];
+            TundraBytes username;
+            TundraBytes ext; /* validated TLVs; read with tundra_reg_find */
+        } reg;                                                                      /* REGISTER */
         struct { TundraBytes text; } message;                                       /* MESSAGE */
         struct { TundraBytes agent; TundraBytes command; } agent_cmd;               /* AGENT_COMMAND */
         struct { TundraBytes data; } pong;                                          /* PONG (opaque) */
@@ -51,7 +55,7 @@ typedef struct {
             TundraBytes sender;
             TundraBytes text;
         } chat;                                                                     /* CHAT */
-        struct { uint64_t id; } sent;                                               /* SENT */
+        struct { uint64_t id; } sent;                                               /* SENT, ACK */
         struct { uint8_t event; TundraBytes room; TundraBytes user; } room_event;   /* ROOM_EVENT */
         /* List messages: `entries` holds `count` encoded entries, read them
          * with the matching tundra_next_* iterator below. Decoding has
@@ -66,6 +70,11 @@ typedef struct {
 int tundra_next_room(TundraReader *it, TundraBytes *room, uint16_t *members);
 int tundra_next_who(TundraReader *it, TundraBytes *user, uint8_t *online);
 int tundra_next_history(TundraReader *it, TundraMsg *chat); /* fills a MSG_CHAT */
+
+/* REGISTER extensions. tundra_reg_find returns 1 and sets `value` when
+ * `tag` is present (first occurrence). tundra_wr_tlv appends one TLV. */
+int tundra_reg_find(TundraBytes ext, uint8_t tag, TundraBytes *value);
+void tundra_wr_tlv(TundraWriter *w, uint8_t tag, const void *value, size_t len);
 
 /* Entry writers for building list messages. */
 void tundra_wr_room_entry(TundraWriter *w, TundraBytes room, uint16_t members);

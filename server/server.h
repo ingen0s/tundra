@@ -17,7 +17,8 @@
 #define DEFAULT_RESUME_GRACE  120       /* seconds a disconnected session is held for reconnect */
 #define REGISTER_TIMEOUT      10        /* seconds a new connection has to send REGISTER */
 #define PING_INTERVAL         30        /* seconds */
-#define MAX_BUFFERED_MESSAGES 50        /* per session backlog; oldest dropped first */
+#define MAX_BUFFERED_MESSAGES 50        /* non-chat frames per session backlog; oldest dropped first */
+#define MAX_WRITE_MARKS       256       /* chat ids tracked per connection until written */
 #define MAX_BACKLOG_BYTES     (1u << 20)   /* per session backlog */
 #define MAX_TOTAL_BACKLOG     (64u << 20)  /* all backlogs together */
 #define MAX_OUTBOUND_BYTES    (1u << 20)   /* per client; slower clients are disconnected */
@@ -32,6 +33,7 @@ typedef struct {
     uint8_t type;
     uint8_t *payload;
     size_t len;
+    uint64_t after_id;          /* last message id when buffered: sent once catch-up passes it */
 } BufferedFrame;
 
 struct Client;
@@ -52,7 +54,14 @@ typedef struct Session {
     size_t backlog_count;
     size_t backlog_bytes;
     uint32_t backlog_dropped;   /* frames dropped since the last resume */
-    int pumping;                /* backlog_pump is on the stack */
+    int pumping;                /* session_pump is on the stack */
+    /* Chat catch-up. CHAT frames are never buffered: the message log has
+     * them, and a session that is behind replays from it. */
+    uint64_t replay_next;       /* next log id to consider; 0 = not replaying */
+    uint64_t start_id;          /* last message id when the session was created: never replay before it */
+    uint64_t written_id;        /* highest CHAT id fully written to a socket */
+    uint64_t acked_id;          /* highest CHAT id the client acknowledged */
+    int has_acked;
     uint32_t latency_ms;
     uint32_t messages_sent;
     uint32_t messages_received;
@@ -69,6 +78,10 @@ typedef struct Client {
     uint8_t *out;
     size_t out_len;
     size_t out_cap;
+    /* where each queued CHAT frame ends in `out`, oldest first */
+    struct { size_t end; uint64_t id; } marks[MAX_WRITE_MARKS];
+    size_t marks_head;
+    size_t marks_count;
     size_t in_len;
     uint8_t in[TUNDRA_MAX_FRAME]; /* keep last: reset code clears everything before it */
 } Client;
@@ -78,6 +91,7 @@ typedef struct {
     char name[TUNDRA_MAX_ROOM + 1];
     uint64_t first_msg_id;      /* messages before this belong to an earlier room of the same name */
     uint8_t members[(MAX_SESSIONS + 7) / 8]; /* bit per session index */
+    uint64_t joined_after[MAX_SESSIONS];     /* last message id when each member joined */
     int member_count;
 } Room;
 
@@ -121,11 +135,17 @@ Session *alloc_session(void); /* may release the longest-detached session */
 void release_session(Session *s);
 void attach(Session *s, Client *c);
 void detach(Client *c);
-/* Delivers a frame to a session: sent now if online, buffered if detached. */
+/* Delivers a frame to a session. Sent now if the session is online and
+ * nothing is pending ahead of it. Otherwise non-chat frames are buffered,
+ * and chat frames are left to the replay (the message log has them). */
 void deliver(Session *s, uint8_t type, const uint8_t *payload, size_t len);
-/* Sends buffered frames while the connection has room; the rest follow
- * from flush_client as the socket drains. */
-void backlog_pump(Session *s);
+/* Sends buffered frames, then any pending chat replay, while the
+ * connection has room; the rest follow from flush_client as it drains. */
+void session_pump(Session *s);
+int session_has_pending(const Session *s);
+/* Starts catching a resumed session up on chats after `after_id`.
+ * Returns 1 if older messages it may have needed were already evicted. */
+int chat_replay_start(Session *s, uint64_t after_id);
 void backlog_clear(Session *s);
 void sessions_expire(void);
 void sessions_ping(void);
@@ -135,6 +155,7 @@ Room *room_find(TundraBytes name);
 Room *room_find_cstr(const char *name);
 Room *room_get_or_create(TundraBytes name);
 int room_is_member(const Room *r, const Session *s);
+uint64_t room_joined_after(const Room *r, const Session *s);
 void room_add(Room *r, Session *s);
 void room_remove(Room *r, Session *s);   /* deletes the room when it empties (except the lobby) */
 void rooms_remove_session(Session *s);   /* on expiry: leaves every room, with events */
@@ -158,6 +179,7 @@ typedef struct {
 const LoggedMessage *msglog_append(uint8_t kind, TundraBytes target, const char *sender, TundraBytes text);
 const LoggedMessage *msglog_get(uint64_t id);   /* NULL if never assigned or evicted */
 uint64_t msglog_last_id(void);
+uint64_t msglog_first_id(void);  /* oldest id still held (last_id + 1 when empty) */
 void msglog_to_chat(const LoggedMessage *m, TundraMsg *out);
 void msglog_free(void);
 
