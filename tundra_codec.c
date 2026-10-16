@@ -1,0 +1,164 @@
+#include "tundra_codec.h"
+
+#include <string.h>
+
+/* ---- field helpers ---- */
+
+static TundraBytes rd_str8(TundraReader *r) {
+    TundraBytes b;
+    b.len = tundra_rd_u8(r);
+    b.p = tundra_rd_bytes(r, b.len);
+    return b;
+}
+
+static TundraBytes rd_str16(TundraReader *r) {
+    TundraBytes b;
+    b.len = tundra_rd_u16(r);
+    b.p = tundra_rd_bytes(r, b.len);
+    return b;
+}
+
+static void wr_str8(TundraWriter *w, TundraBytes b) {
+    if (b.len > 0xFF) { w->ok = 0; return; }
+    tundra_wr_u8(w, (uint8_t)b.len);
+    tundra_wr_bytes(w, b.p, b.len);
+}
+
+static void wr_str16(TundraWriter *w, TundraBytes b) {
+    if (b.len > 0xFFFF) { w->ok = 0; return; }
+    tundra_wr_u16(w, (uint16_t)b.len);
+    tundra_wr_bytes(w, b.p, b.len);
+}
+
+/* ---- decode ---- */
+
+int tundra_decode(uint8_t type, const uint8_t *payload, size_t len, TundraMsg *out) {
+    TundraReader r = tundra_reader(payload, len);
+    memset(out, 0, sizeof(*out));
+    out->type = type;
+
+    switch (type) {
+        case MSG_REGISTER: {
+            const uint8_t *id = tundra_rd_bytes(&r, TUNDRA_UUID_LEN);
+            if (id) memcpy(out->u.reg.id, id, TUNDRA_UUID_LEN);
+            out->u.reg.username = rd_str8(&r);
+            break;
+        }
+        case MSG_MESSAGE:
+            out->u.message.text = rd_str16(&r);
+            break;
+        case MSG_AGENT_COMMAND:
+            out->u.agent_cmd.agent = rd_str8(&r);
+            out->u.agent_cmd.command = rd_str16(&r);
+            break;
+        case MSG_PONG:
+            out->u.pong.data.p = payload;
+            out->u.pong.data.len = len;
+            r.pos = len;
+            break;
+        case MSG_HEALTH_CHECK:
+            break;
+        case MSG_SYSTEM: {
+            const uint8_t *id = tundra_rd_bytes(&r, TUNDRA_UUID_LEN);
+            if (id) memcpy(out->u.system.id, id, TUNDRA_UUID_LEN);
+            out->u.system.text = rd_str16(&r);
+            break;
+        }
+        case MSG_BROADCAST_MESSAGE:
+        case MSG_BROADCAST_AGENT:
+            out->u.broadcast.sender = rd_str8(&r);
+            out->u.broadcast.ts_ms = tundra_rd_u64(&r);
+            out->u.broadcast.text = rd_str16(&r);
+            break;
+        case MSG_PING:
+            out->u.ping.ts_ms = tundra_rd_u64(&r);
+            break;
+        case MSG_ERROR:
+            out->u.error.code = tundra_rd_u16(&r);
+            out->u.error.text = rd_str16(&r);
+            break;
+        case MSG_HEALTH_RESULT:
+            out->u.health.ts_ms = tundra_rd_u64(&r);
+            out->u.health.status = tundra_rd_u8(&r);
+            out->u.health.latency_ms = tundra_rd_u32(&r);
+            out->u.health.uptime_ms = tundra_rd_u32(&r);
+            out->u.health.sent = tundra_rd_u32(&r);
+            out->u.health.received = tundra_rd_u32(&r);
+            break;
+        default:
+            return TUNDRA_DECODE_UNKNOWN;
+    }
+    return tundra_rd_done(&r) ? TUNDRA_DECODE_OK : TUNDRA_DECODE_MALFORMED;
+}
+
+/* ---- encode ---- */
+
+long tundra_encode(const TundraMsg *m, uint8_t *buf, size_t cap) {
+    TundraWriter w = tundra_writer(buf, cap);
+
+    switch (m->type) {
+        case MSG_REGISTER:
+            tundra_wr_bytes(&w, m->u.reg.id, TUNDRA_UUID_LEN);
+            wr_str8(&w, m->u.reg.username);
+            break;
+        case MSG_MESSAGE:
+            wr_str16(&w, m->u.message.text);
+            break;
+        case MSG_AGENT_COMMAND:
+            wr_str8(&w, m->u.agent_cmd.agent);
+            wr_str16(&w, m->u.agent_cmd.command);
+            break;
+        case MSG_PONG:
+            tundra_wr_bytes(&w, m->u.pong.data.p, m->u.pong.data.len);
+            break;
+        case MSG_HEALTH_CHECK:
+            break;
+        case MSG_SYSTEM:
+            tundra_wr_bytes(&w, m->u.system.id, TUNDRA_UUID_LEN);
+            wr_str16(&w, m->u.system.text);
+            break;
+        case MSG_BROADCAST_MESSAGE:
+        case MSG_BROADCAST_AGENT:
+            wr_str8(&w, m->u.broadcast.sender);
+            tundra_wr_u64(&w, m->u.broadcast.ts_ms);
+            wr_str16(&w, m->u.broadcast.text);
+            break;
+        case MSG_PING:
+            tundra_wr_u64(&w, m->u.ping.ts_ms);
+            break;
+        case MSG_ERROR:
+            tundra_wr_u16(&w, m->u.error.code);
+            wr_str16(&w, m->u.error.text);
+            break;
+        case MSG_HEALTH_RESULT:
+            tundra_wr_u64(&w, m->u.health.ts_ms);
+            tundra_wr_u8(&w, m->u.health.status);
+            tundra_wr_u32(&w, m->u.health.latency_ms);
+            tundra_wr_u32(&w, m->u.health.uptime_ms);
+            tundra_wr_u32(&w, m->u.health.sent);
+            tundra_wr_u32(&w, m->u.health.received);
+            break;
+        default:
+            return -1;
+    }
+    if (!w.ok || w.len > TUNDRA_MAX_PAYLOAD) return -1;
+    return (long)w.len;
+}
+
+const char *tundra_type_name(uint8_t type) {
+    switch (type) {
+        case MSG_REGISTER:          return "REGISTER";
+        case MSG_MESSAGE:           return "MESSAGE";
+        case MSG_AGENT_COMMAND:     return "AGENT_COMMAND";
+        case MSG_PONG:              return "PONG";
+        case MSG_HEALTH_CHECK:      return "HEALTH_CHECK";
+        case MSG_SYSTEM:            return "SYSTEM";
+        case MSG_BROADCAST_MESSAGE: return "BROADCAST_MESSAGE";
+        case MSG_BROADCAST_AGENT:   return "BROADCAST_AGENT";
+        case MSG_IMAGE:             return "IMAGE";
+        case MSG_PING:              return "PING";
+        case MSG_ERROR:             return "ERROR";
+        case MSG_HEALTH_RESULT:     return "HEALTH_RESULT";
+        default:                    return "UNKNOWN";
+    }
+}

@@ -18,6 +18,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #define TUNDRA_VERSION      0x01
 #define TUNDRA_HEADER_LEN   7
@@ -119,6 +120,13 @@ static inline uint16_t tundra_rd_u16(TundraReader *r) {
     return v;
 }
 
+static inline uint32_t tundra_rd_u32(TundraReader *r) {
+    if (!r->ok || r->len - r->pos < 4) { r->ok = 0; return 0; }
+    const uint8_t *p = r->p + r->pos;
+    r->pos += 4;
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
 static inline uint64_t tundra_rd_u64(TundraReader *r) {
     if (!r->ok || r->len - r->pos < 8) { r->ok = 0; return 0; }
     uint64_t v = tundra_get_u64(r->p + r->pos);
@@ -136,6 +144,52 @@ static inline const uint8_t *tundra_rd_bytes(TundraReader *r, size_t n) {
 /* True when every read succeeded and the whole payload was consumed. */
 static inline int tundra_rd_done(const TundraReader *r) {
     return r->ok && r->pos == r->len;
+}
+
+/* ---- bounds-checked payload writer ----
+ * Mirrors the reader: once a write would overflow, `ok` stays 0. */
+typedef struct {
+    uint8_t *p;
+    size_t cap;
+    size_t len;
+    int ok;
+} TundraWriter;
+
+static inline TundraWriter tundra_writer(uint8_t *p, size_t cap) {
+    TundraWriter w = { p, cap, 0, 1 };
+    return w;
+}
+
+static inline uint8_t *tundra_wr_reserve(TundraWriter *w, size_t n) {
+    if (!w->ok || w->cap - w->len < n) { w->ok = 0; return NULL; }
+    uint8_t *b = w->p + w->len;
+    w->len += n;
+    return b;
+}
+
+static inline void tundra_wr_u8(TundraWriter *w, uint8_t v) {
+    uint8_t *b = tundra_wr_reserve(w, 1);
+    if (b) b[0] = v;
+}
+
+static inline void tundra_wr_u16(TundraWriter *w, uint16_t v) {
+    uint8_t *b = tundra_wr_reserve(w, 2);
+    if (b) tundra_put_u16(b, v);
+}
+
+static inline void tundra_wr_u32(TundraWriter *w, uint32_t v) {
+    uint8_t *b = tundra_wr_reserve(w, 4);
+    if (b) tundra_put_u32(b, v);
+}
+
+static inline void tundra_wr_u64(TundraWriter *w, uint64_t v) {
+    uint8_t *b = tundra_wr_reserve(w, 8);
+    if (b) tundra_put_u64(b, v);
+}
+
+static inline void tundra_wr_bytes(TundraWriter *w, const void *src, size_t n) {
+    uint8_t *b = tundra_wr_reserve(w, n);
+    if (b && n) memcpy(b, src, n);
 }
 
 #endif /* TUNDRA_PROTOCOL_H */
