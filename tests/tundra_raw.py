@@ -22,9 +22,19 @@ def register(name, sid=bytes(16)):
     return frame(0x01, sid + s8(name))
 
 
+def tls_wrap(sock, cafile=None):
+    """Wraps a connected socket in TLS: verified against `cafile`, or not
+    verified at all when cafile is None (self-signed test setups)."""
+    import ssl
+    ctx = ssl.create_default_context(cafile=cafile) if cafile else ssl._create_unverified_context()
+    return ctx.wrap_socket(sock, server_hostname="localhost")
+
+
 class Conn:
-    def __init__(self, port, timeout=2.0):
+    def __init__(self, port, timeout=2.0, tls=False, cafile=None):
         self.sock = socket.create_connection(("127.0.0.1", port))
+        if tls:
+            self.sock = tls_wrap(self.sock, cafile)
         self.sock.settimeout(timeout)
         self.buf = b""
 
@@ -78,8 +88,10 @@ class WsConn(Conn):
     """Same interface as Conn, but speaks WebSocket: each Tundra frame is one
     masked binary message. `handshake` holds the server's 101 response."""
 
-    def __init__(self, port, path="/ws", key="dGhlIHNhbXBsZSBub25jZQ==", timeout=2.0):
+    def __init__(self, port, path="/ws", key="dGhlIHNhbXBsZSBub25jZQ==", timeout=2.0, tls=False, cafile=None):
         self.sock = socket.create_connection(("127.0.0.1", port))
+        if tls:
+            self.sock = tls_wrap(self.sock, cafile)
         self.sock.settimeout(timeout)
         self.raw = b""
         self.buf = b""

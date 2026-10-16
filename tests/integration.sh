@@ -1022,6 +1022,100 @@ if python3 "$ROOT/tests/sdk_test.py" "$PORT" >"$TMP/sdk.out" 2>&1; then :; else 
 cat "$TMP/sdk.out"
 stop_server ws
 
+# 26. built-in TLS
+if "$SERVER" -h 2>&1 | grep -q -- "-C  TLS" && command -v openssl >/dev/null && "$CLIENT" -h 2>&1 | grep -q -- "-s"; then
+    # a throwaway CA and a localhost certificate signed by it
+    (
+        cd "$TMP" &&
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem -days 2 -subj "/CN=Tundra test CA" \
+            -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null &&
+        openssl req -newkey rsa:2048 -nodes -keyout tls.key -out tls.csr -subj "/CN=localhost" 2>/dev/null &&
+        printf '%s\n' 'subjectAltName=DNS:localhost,IP:127.0.0.1' 'basicConstraints=CA:FALSE' \
+            'keyUsage=critical,digitalSignature,keyEncipherment' 'extendedKeyUsage=serverAuth' \
+            'authorityKeyIdentifier=keyid,issuer' >san.ext &&
+        openssl x509 -req -in tls.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out tls.pem -days 2 -extfile san.ext 2>/dev/null
+    ) || fail "generate test certificates"
+    PORT=$((BASE_PORT + 11))
+    TLSWS=$((BASE_PORT + 12))
+    start_server tls "$PORT" -w "$TLSWS" -C "$TMP/tls.pem" -K "$TMP/tls.key"
+    expect "server reports TLS" "$TMP/tls.log" "tls: enabled"
+    expect "web port is https" "$TMP/tls.log" "https://localhost:$TLSWS/"
+
+    client -u tlsbob -s -x -w 3 >"$TMP/tlsbob.out" &
+    TB=$!
+    wait_line "$TMP/tlsbob.out" "SYSTEM Welcome, tlsbob!"
+    client -u tlsalice -s -x -m "hello over tls" -w 0.3 >"$TMP/tlsalice.out"
+    wait $TB
+    expect "chat over TLS" "$TMP/tlsbob.out" "#lobby tlsalice hello over tls"
+    client -u tlsverify -s -w 0.3 >"$TMP/tlsverify.out" 2>&1
+    expect "an untrusted certificate fails verification" "$TMP/tlsverify.out" "certificate verify failed"
+    client -u tlsplain -w 0.3 >"$TMP/tlsplain.out" 2>&1
+    expect_not "plaintext clients cannot register on a TLS port" "$TMP/tlsplain.out" "SYSTEM Welcome"
+
+    raw >"$TMP/tlsraw.out" <<PY
+import sys, struct, ssl, asyncio, urllib.request, time
+from tundra_raw import *
+port = int(sys.argv[1]); wsport = $TLSWS
+ca = "$TMP/ca.pem"
+
+# verified against the test CA, large frames and bursts through OpenSSL's buffers
+a = Conn(port, tls=True, cafile=ca)
+a.send(register(b"tlsraw1"))
+a.wait_for(0x10)
+b = Conn(port, tls=True, cafile=ca)
+b.send(register(b"tlsraw2"))
+b.wait_for(0x10)
+time.sleep(0.2)
+a.send(frame(0x02, s16(b"z" * 60000)))
+f = b.wait_for(0x17)
+print("tls-large", len(f[1]) if f else None)
+burst = b"".join(frame(0x02, s16(b"burst%03d" % i)) for i in range(300))
+a.send(burst)
+got = 0
+while True:
+    f = b.wait_for(0x17, 1.0)
+    if not f:
+        break
+    got += 1
+print("tls-burst", got)
+
+# WebSocket over TLS (wss) and the web client over https
+w = WsConn(wsport, tls=True, cafile=ca)
+print("wss-handshake", "101" in w.handshake)
+w.send(register(b"wssuser"))
+print("wss-register", w.recv_frame()[0])
+ctx = ssl.create_default_context(cafile=ca)
+body = urllib.request.urlopen("https://localhost:%d/" % wsport, context=ctx).read()
+print("https-web-client", b"<title>Tundra</title>" in body)
+
+# Python SDK with a context that trusts the test CA
+sys.path.insert(0, "$ROOT/sdk/python")
+import tundra
+async def sdk():
+    c = tundra.Client("localhost", port, "tlssdk", ssl=ssl.create_default_context(cafile=ca))
+    await c.connect()
+    mid = await c.send("#lobby", "sdk over tls")
+    await c.close()
+    return mid > 0
+print("sdk-over-tls", asyncio.run(sdk()))
+PY
+    expect "large message over TLS" "$TMP/tlsraw.out" "tls-large 60034"
+    expect "a 300-message burst arrives in full over TLS" "$TMP/tlsraw.out" "tls-burst 300"
+    expect "wss handshake" "$TMP/tlsraw.out" "wss-handshake True"
+    expect "register over wss" "$TMP/tlsraw.out" "wss-register 16"
+    expect "web client over https" "$TMP/tlsraw.out" "https-web-client True"
+    expect "Python SDK over verified TLS" "$TMP/tlsraw.out" "sdk-over-tls True"
+    stop_server tls
+
+    if "$SERVER" -p $((BASE_PORT + 13)) -C "$TMP/tls.pem" -K "$TMP/ca.key" 2>"$TMP/badkey.log"; then
+        fail "a key that does not match the certificate is refused"
+    else
+        expect "a key that does not match the certificate is refused" "$TMP/badkey.log" "matching the certificate"
+    fi
+else
+    echo "skip - built without TLS or no openssl command"
+fi
+
 if [ "$FAILED" -ne 0 ]; then
     for log in "$TMP"/*.log; do echo "--- $(basename "$log") ---"; tail -40 "$log"; done
     exit 1
