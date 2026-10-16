@@ -60,6 +60,23 @@ jobs:
       - name: Web client in jsdom
         run: ./tests/web_ui.sh
 
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libssl-dev
+      - name: TypeScript SDK against a live server
+        run: ./tests/ts_sdk.sh
+      - name: Package contents
+        working-directory: sdk/typescript
+        run: |
+          npm pack --dry-run 2>&1 | tee "$RUNNER_TEMP/pack.log"
+          grep -q "dist/index.d.ts" "$RUNNER_TEMP/pack.log"
+
   no-tls:
     # the build without OpenSSL still works and refuses -C/-K clearly
     runs-on: ubuntu-latest

@@ -2,3 +2,5 @@ build/
 __pycache__/
 node_modules/
 package-lock.json
+sdk/typescript/node_modules/
+sdk/typescript/dist/

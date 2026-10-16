@@ -14,7 +14,7 @@ Early but tested. The server is single-threaded and event-driven (epoll on Linux
 - **Message ids and history:** every message gets a server-assigned id; the most recent 10,000 are kept in memory and can be paged with `HISTORY`.
 - **Session resume with exact catch-up:** a dropped connection keeps its name and rooms for 2 minutes. Reconnecting replays every message it missed from the server's log, starting after the client's last `ACK`, an explicit resume point, or what the server knows it wrote, paced so a long catch-up never overflows the connection.
 - **Agents:** any session can advertise capabilities; others send it typed requests with their own ids and get back streamed or single responses. The server enforces that answers match open requests and closes requests that time out or whose agent leaves.
-- **Browsers and Python:** an optional HTTP port serves a bundled web client and a WebSocket endpoint that carries the same frames; `sdk/python` is a dependency-free asyncio client with agent support and automatic reconnect.
+- **Browsers, Python and TypeScript:** an optional HTTP port serves a bundled web client and a WebSocket endpoint that carries the same frames; `sdk/python` is a dependency-free asyncio client and `sdk/typescript` a dependency-free client for Node and browsers, both with agent support and automatic reconnect.
 - **Optional token auth:** a `username token` file protects listed names (or, with `-A`, all of them); re-read on `SIGHUP` (Linux and macOS; on Windows, restart the server).
 - **Optional persistence:** with `-d chat.db`, messages go to SQLite; history pages back indefinitely and ids continue across restarts.
 - **Health:** ping/pong latency and per-session counters via `HEALTH_CHECK`.
@@ -135,6 +135,30 @@ asyncio.run(agent.run_forever())
 
 The client answers pings, acknowledges what it receives, and on a dropped connection reconnects and resumes its session, catching up on anything it missed. See `sdk/python/examples/`.
 
+## TypeScript SDK
+
+`sdk/typescript` (`@tundra/client`) runs in Node and browsers with no runtime dependencies: TCP or TLS in Node, WebSocket (the server's `-w` port, path `/ws`) in browsers and Node 22+. It mirrors the Python SDK, including reconnect with resume and agents.
+
+```ts
+import { Client, Agent } from "@tundra/client";
+
+const client = await Client.connect({ host: "localhost", port: 4242, username: "alice" });
+// in a browser: await Client.connect({ url: "ws://localhost:8080/ws", username: "alice" })
+await client.join("#dev");
+await client.send("#dev", "hello");
+console.log(await client.request("echo", "summarize this"));
+for await (const msg of client.messages()) console.log(msg.sender, msg.text);
+
+const agent = new Agent({ port: 4242, username: "summarizer", capabilities: { skills: ["summarize"] } });
+agent.handler(async function* (req) {
+  yield "working on it";
+  yield "summary of: " + req.body;
+});
+await agent.runForever();
+```
+
+Build with `cd sdk/typescript && npm install && npm run build`; see [sdk/typescript/README.md](sdk/typescript/README.md).
+
 ## Development
 
 ```bash
@@ -143,6 +167,7 @@ make asan && ./tests/integration.sh     # same, under AddressSanitizer + UBSan
 make fuzz-run FUZZ_TIME=60              # fuzz the payload codec (needs clang)
 (cd tests/web && npm install) && ./tests/web_ui.sh   # web client in jsdom (needs node)
 python3 tests/smoke.py build/tundra_chat_server     # cross-platform smoke test (also runs on Windows)
+./tests/ts_sdk.sh                       # TypeScript SDK against a live server (needs node 22)
 ```
 
 Layout:
@@ -155,6 +180,7 @@ Layout:
 | `server/` | server: `net.c` (epoll, I/O), `ws.c` (HTTP/WebSocket), `session.c`, `rooms.c`, `msglog.c`, `store.c` (SQLite), `auth.c`, `agents.c`, `handlers.c`, `main.c` |
 | `web/index.html` | bundled browser client (embedded into the server at build time) |
 | `sdk/python/` | Python SDK and examples |
+| `sdk/typescript/` | TypeScript SDK (Node and browsers) |
 | `test_client.c` | scriptable CLI client |
 | `tests/` | codec unit tests, `integration.sh` and `smoke.py` |
 | `tools/` | build helpers and the release `install.sh` |
@@ -200,7 +226,7 @@ Compile-time constants in `server/server.h` (two have command-line overrides):
 ## Roadmap
 
 - Persisting sessions and room membership across restarts (messages already persist with `-d`)
-- SDKs for more languages
+- SDKs for more languages (Python and TypeScript exist today)
 
 ## License
 
