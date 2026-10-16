@@ -52,6 +52,11 @@ enum TundraMessageType {
     MSG_ACK               = 0x0A, /* id(8): every CHAT up to and including id is processed */
     MSG_HISTORY           = 0x0B, /* rlen(1) room before_id(8) limit(2)               */
     MSG_WHO               = 0x0C, /* rlen(1) room                                     */
+    MSG_AGENT_ADVERTISE   = 0x20, /* clen(2) capabilities (opaque, usually JSON)      */
+    MSG_AGENT_REQUEST     = 0x21, /* alen(1) agent req_id(8) blen(2) body             */
+    MSG_AGENT_RESPONSE    = 0x22, /* rlen(1) requester req_id(8) status(1) final(1)
+                                     blen(2) body                                     */
+    MSG_LIST_AGENTS       = 0x23, /* empty                                            */
 
     /* server -> client */
     MSG_SYSTEM            = 0x10, /* id(16) mlen(2) text(mlen); id is nil for notices */
@@ -69,8 +74,28 @@ enum TundraMessageType {
     MSG_ROOM_EVENT        = 0x1A, /* event(1) rlen(1) room ulen(1) user               */
     MSG_HISTORY_RESULT    = 0x1B, /* rlen(1) room count(2) then count x
                                      [len(2) CHAT payload], oldest first              */
-    MSG_WHO_RESULT        = 0x1C  /* rlen(1) room count(2) then count x
+    MSG_WHO_RESULT        = 0x1C, /* rlen(1) room count(2) then count x
                                      [ulen(1) user online(1)]                         */
+    MSG_AGENT_LIST        = 0x30, /* count(2) then count x
+                                     [nlen(1) name online(1) clen(2) capabilities]    */
+    MSG_AGENT_REQUEST_IN  = 0x31, /* flen(1) from req_id(8) blen(2) body              */
+    MSG_AGENT_RESPONSE_IN = 0x32  /* alen(1) agent req_id(8) status(1) final(1)
+                                     blen(2) body                                     */
+};
+
+/* Valid client -> server types. */
+static inline int tundra_is_client_type(uint8_t t) {
+    return (t >= 0x01 && t <= 0x0F) || (t >= 0x20 && t <= 0x2F);
+}
+
+#define TUNDRA_MAX_CAPABILITIES 8192
+
+enum TundraAgentStatus {
+    AGENT_OK          = 0, /* success; body is the result                   */
+    AGENT_ERROR       = 1, /* the agent failed; body explains               */
+    AGENT_REJECTED    = 2, /* the agent declined the request                */
+    AGENT_TIMEOUT     = 3, /* sent by the server: no final response in time */
+    AGENT_UNAVAILABLE = 4  /* sent by the server: the agent went away       */
 };
 
 /* REGISTER extensions: zero or more TLVs after the username,
@@ -99,7 +124,9 @@ enum TundraErrorCode {
     ERR_NO_SUCH_TARGET  = 0x0006, /* unknown user or room */
     ERR_NOT_A_MEMBER    = 0x0007, /* room action that needs membership */
     ERR_INVALID_NAME    = 0x0008, /* bad room or user name */
-    ERR_UNAUTHORIZED    = 0x0009  /* missing or wrong token for this username */
+    ERR_UNAUTHORIZED    = 0x0009, /* missing or wrong token for this username */
+    ERR_NOT_AN_AGENT    = 0x000A, /* target has not advertised as an agent */
+    ERR_BAD_REQUEST     = 0x000B  /* duplicate request id, no such request, too many pending */
 };
 
 /* ---- big-endian helpers ---- */

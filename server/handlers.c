@@ -413,7 +413,7 @@ void handle_frame(Client *c, const uint8_t *frame, size_t payload_len) {
 
     TundraMsg m;
     int rc = tundra_decode(type, frame + TUNDRA_HEADER_LEN, payload_len, &m);
-    if (rc == TUNDRA_DECODE_UNKNOWN || type >= 0x10) {
+    if (rc == TUNDRA_DECODE_UNKNOWN || !tundra_is_client_type(type)) {
         send_error(c, seq, ERR_INVALID_FORMAT, "Unknown message type");
         return;
     }
@@ -444,6 +444,10 @@ void handle_frame(Client *c, const uint8_t *frame, size_t payload_len) {
         case MSG_HISTORY:       handle_history(c, seq, &m); break;
         case MSG_AGENT_COMMAND: handle_agent_command(c, seq, &m); break;
         case MSG_ACK:           handle_ack(c, m.u.sent.id); break;
+        case MSG_AGENT_ADVERTISE: handle_agent_advertise(c, seq, m.u.advertise.capabilities); break;
+        case MSG_AGENT_REQUEST:   handle_agent_request(c, seq, &m); break;
+        case MSG_AGENT_RESPONSE:  handle_agent_response(c, seq, &m); break;
+        case MSG_LIST_AGENTS:     handle_list_agents(c, seq); break;
         case MSG_PONG:          handle_pong(c, m.u.pong.data); break;
         case MSG_HEALTH_CHECK:  handle_health_check(c, seq); break;
         default:                send_error(c, seq, ERR_INVALID_FORMAT, "Unknown message type"); break;

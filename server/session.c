@@ -38,6 +38,7 @@ Session *find_session_by_bytes(TundraBytes name) {
 
 void release_session(Session *s) {
     log_info("%s session released", s->username);
+    agents_session_released(s);
     rooms_remove_session(s); /* sends "left" events, which may queue one for s itself */
     backlog_clear(s);        /* so clear afterwards */
     s->state = SESSION_FREE;

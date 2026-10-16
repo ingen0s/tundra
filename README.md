@@ -1,6 +1,6 @@
 # Tundra
 
-A small, fast chat server in C with a compact binary protocol. Rooms, direct messages, history and session resume, built for both people and software agents talking over the same wire.
+A small, fast chat server in C with a compact binary protocol. Rooms, direct messages, history and session resume for people, and typed request/response routing for software agents, over the same wire.
 
 ## Status
 
@@ -13,6 +13,7 @@ Early but tested. The server is single-threaded on Linux epoll, handles up to 1,
 - **Direct messages** between users.
 - **Message ids and history:** every message gets a server-assigned id; the most recent 10,000 are kept in memory and can be paged with `HISTORY`.
 - **Session resume with exact catch-up:** a dropped connection keeps its name and rooms for 2 minutes. Reconnecting replays every message it missed from the server's log, starting after the client's last `ACK`, an explicit resume point, or what the server knows it wrote, paced so a long catch-up never overflows the connection.
+- **Agents:** any session can advertise capabilities; others send it typed requests with their own ids and get back streamed or single responses. The server enforces that answers match open requests and closes requests that time out or whose agent leaves.
 - **Optional token auth:** a `username token` file protects listed names (or, with `-A`, all of them); re-read on `SIGHUP`.
 - **Optional persistence:** with `-d chat.db`, messages go to SQLite; history pages back indefinitely and ids continue across restarts.
 - **Health:** ping/pong latency and per-session counters via `HEALTH_CHECK`.
@@ -34,6 +35,13 @@ In two more terminals:
 ./build/tundra_client -u bob -j '#dev' -t '#dev' -m 'hello dev' -t alice -m 'hi alice (dm)'
 ```
 
+An agent and a client that uses it:
+
+```bash
+./build/tundra_client -u echo -G '{"skills":["echo"]}' -E -w 60
+./build/tundra_client -u carol -Q -q 'echo:summarize the standup'
+```
+
 ## Test client
 
 `tundra_client` registers, runs the actions you give it in order, then prints everything it receives for `-w` seconds (one line per frame) and answers pings.
@@ -46,6 +54,10 @@ In two more terminals:
 | `-f id` | with `-r`: replay everything after this message id |
 | `-a` | acknowledge every chat message received |
 | `-k token` | authentication token for this username |
+| `-G caps` | advertise as an agent with these capabilities |
+| `-q agent:body` | send an agent request |
+| `-Q` | list agents |
+| `-E` / `-S` | act as an echo agent / stream a partial answer first |
 | `-j #room` / `-L #room` | join / leave a room |
 | `-t target` | target for following `-m`: a `#room` or a username (default `#lobby`) |
 | `-m text` | send a message |
@@ -69,7 +81,7 @@ Layout:
 |------|------|
 | `tundra_protocol.h` | wire constants, big-endian helpers, bounds-checked reader/writer |
 | `tundra_codec.{h,c}` | decode/encode for every message type |
-| `server/` | server: `net.c` (epoll, I/O), `session.c`, `rooms.c`, `msglog.c`, `store.c` (SQLite), `auth.c`, `handlers.c`, `main.c` |
+| `server/` | server: `net.c` (epoll, I/O), `session.c`, `rooms.c`, `msglog.c`, `store.c` (SQLite), `auth.c`, `agents.c`, `handlers.c`, `main.c` |
 | `test_client.c` | scriptable CLI client |
 | `tests/` | codec unit tests and `integration.sh` |
 | `fuzz/` | libFuzzer target and seed corpus |
@@ -89,6 +101,7 @@ Server options:
 | `-A` | with `-t`: every username must be listed |
 | `-i seconds` | idle timeout (default 120) |
 | `-g seconds` | how long a disconnected session is held (default 120) |
+| `-T seconds` | how long an agent request may stay unanswered (default 60) |
 | `-v` | log every frame |
 
 Compile-time constants in `server/server.h` (two have command-line overrides):
@@ -109,7 +122,6 @@ Compile-time constants in `server/server.h` (two have command-line overrides):
 ## Roadmap
 
 - Built-in TLS
-- Typed agent messaging: agents advertise capabilities, request/response with correlation ids
 - WebSocket gateway, browser client, Python SDK
 
 ## License

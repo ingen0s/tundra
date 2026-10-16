@@ -171,6 +171,40 @@ int main(void) {
     uint16_t members = 0;
     CHECK(tundra_next_room(&it, &room, &members) && bytes_eq(room, "#lobby") && members == 3, "room list entry survives");
 
+    /* AGENT_RESPONSE round trip and AGENT_LIST iteration */
+    {
+        memset(&in, 0, sizeof(in));
+        in.type = MSG_AGENT_RESPONSE;
+        in.u.agent_resp.peer = str("asker");
+        in.u.agent_resp.req_id = 77;
+        in.u.agent_resp.status = AGENT_OK;
+        in.u.agent_resp.final = 1;
+        in.u.agent_resp.body = str("done");
+        n = tundra_encode(&in, buf, sizeof(buf));
+        CHECK(n == 6 + 8 + 1 + 1 + 6, "agent response encodes to expected size");
+        CHECK(tundra_decode(MSG_AGENT_RESPONSE, buf, (size_t)n, &out) == TUNDRA_DECODE_OK &&
+              out.u.agent_resp.req_id == 77 && out.u.agent_resp.final == 1 && bytes_eq(out.u.agent_resp.body, "done"),
+              "agent response fields survive");
+
+        static uint8_t aentries[256];
+        TundraWriter aw = tundra_writer(aentries, sizeof(aentries));
+        tundra_wr_agent_entry(&aw, str("echo1"), 1, str("{}"));
+        memset(&in, 0, sizeof(in));
+        in.type = MSG_AGENT_LIST;
+        in.u.list.count = 1;
+        in.u.list.entries.p = aentries;
+        in.u.list.entries.len = aw.len;
+        n = tundra_encode(&in, buf, sizeof(buf));
+        CHECK(n > 0 && tundra_decode(MSG_AGENT_LIST, buf, (size_t)n, &out) == TUNDRA_DECODE_OK, "agent list decodes");
+        TundraReader ait = tundra_reader(out.u.list.entries.p, out.u.list.entries.len);
+        TundraBytes aname, acaps;
+        uint8_t aonline = 0;
+        CHECK(tundra_next_agent(&ait, &aname, &aonline, &acaps) && bytes_eq(aname, "echo1") && aonline == 1 &&
+              bytes_eq(acaps, "{}"), "agent list entry survives");
+        CHECK(tundra_is_client_type(MSG_AGENT_REQUEST) && !tundra_is_client_type(MSG_AGENT_REQUEST_IN) &&
+              !tundra_is_client_type(MSG_CHAT), "client type ranges");
+    }
+
     if (failures) {
         printf("%d codec test(s) failed\n", failures);
         return 1;

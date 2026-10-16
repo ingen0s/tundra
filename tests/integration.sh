@@ -719,6 +719,82 @@ client -u jay -j "#gone" -y "#gone" -w 0.3 >"$TMP/store3.out"
 expect "a deleted room stays empty after a restart" "$TMP/store3.out" "HISTORY #gone 0"
 stop_server store3
 
+# 22. typed agent messaging
+PORT=$((BASE_PORT + 5))
+start_server agents "$PORT" -T 1
+client -u echo1 -G '{"skills":["echo"]}' -E -w 4 >"$TMP/echo1.out" &
+ECHO1=$!
+client -u streamer -G '{"skills":["stream"]}' -E -S -w 4 >"$TMP/streamer.out" &
+STREAMER=$!
+client -u silent -G '{"skills":["nothing"]}' -w 4 >"$TMP/silent.out" &
+SILENT=$!
+client -u plainuser -w 4 >/dev/null &
+PLAIN=$!
+wait_line "$TMP/echo1.out" "SYSTEM Welcome, echo1!"
+wait_line "$TMP/streamer.out" "SYSTEM Welcome, streamer!"
+wait_line "$TMP/silent.out" "SYSTEM Welcome, silent!"
+sleep 0.2
+client -u asker -Q -q "echo1:hello agent" -q "streamer:go" -q "plainuser:hi" -q "ghost:hi" -w 0.6 >"$TMP/asker.out"
+expect "agent list shows advertised agents" "$TMP/asker.out" 'AGENTINFO echo1 1 {"skills":["echo"]}'
+expect_not "agent list leaves out plain users" "$TMP/asker.out" "AGENTINFO plainuser"
+expect "agent receives the request" "$TMP/echo1.out" "AREQ asker 1 hello agent"
+expect "requester receives the response" "$TMP/asker.out" "ARESP echo1 1 0 1 echo: hello agent"
+expect "streamed partial response" "$TMP/asker.out" "ARESP streamer 2 0 0 working"
+expect "streamed final response" "$TMP/asker.out" "ARESP streamer 2 0 1 echo: go"
+expect "request to a non-agent is refused" "$TMP/asker.out" "ERROR 10 "
+expect "request to an unknown agent is refused" "$TMP/asker.out" "ERROR 6 No such agent"
+
+raw >"$TMP/agentraw.out" <<'PY'
+import sys, struct, time
+from tundra_raw import *
+port = int(sys.argv[1])
+def req(agent, rid, body):
+    return frame(0x21, s8(agent) + struct.pack(">Q", rid) + s16(body))
+def resp(to, rid, status, final, body):
+    return frame(0x22, s8(to) + struct.pack(">QBB", rid, status, final) + s16(body))
+
+a = Conn(port)
+a.send(register(b"rawasker"))
+a.wait_for(0x10)
+a.send(req(b"silent", 7, b"first"))
+a.send(req(b"silent", 7, b"again"))
+f = a.wait_for(0x15)
+print("duplicate-id", error_code(f[1]) if f else None)
+
+m = Conn(port)
+m.send(register(b"meddler"))
+m.wait_for(0x10)
+m.send(resp(b"rawasker", 7, 0, 1, b"spoofed"))
+f = m.wait_for(0x15)
+print("spoofed-response", error_code(f[1]) if f else None)
+
+f = a.wait_for(0x32, 4)
+if f:
+    p = f[1]
+    nl = p[0]; rid, status, final = struct.unpack(">QBB", p[1 + nl:11 + nl])
+    print("timeout", p[1:1 + nl].decode(), rid, status, final)
+else:
+    print("timeout none")
+
+a.send(frame(0x20, s16(b"x" * 8193)))
+f = a.wait_for(0x15)
+print("caps-too-large", error_code(f[1]) if f else None)
+PY
+expect "duplicate request id refused" "$TMP/agentraw.out" "duplicate-id 11"
+expect "response to someone else's request refused" "$TMP/agentraw.out" "spoofed-response 11"
+expect "unanswered request times out" "$TMP/agentraw.out" "timeout silent 7 3 1"
+expect "oversized capabilities refused" "$TMP/agentraw.out" "caps-too-large 2"
+wait $ECHO1 $STREAMER $SILENT $PLAIN
+stop_server agents
+
+# 23. requests to an agent that goes away are closed
+PORT=$((BASE_PORT + 6))
+start_server agents2 "$PORT" -g 1
+client -u flaky -G '{}' -w 0.3 >"$TMP/flaky.out"
+client -u waiter -q "flaky:are you there" -w 4 >"$TMP/waiter.out"
+expect "request to a vanished agent gets unavailable" "$TMP/waiter.out" "ARESP flaky 1 4 1 "
+stop_server agents2
+
 if [ "$FAILED" -ne 0 ]; then
     for log in "$TMP"/*.log; do echo "--- $(basename "$log") ---"; tail -40 "$log"; done
     exit 1
