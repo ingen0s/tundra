@@ -14,6 +14,7 @@ Early but tested. The server is single-threaded on Linux epoll, handles up to 1,
 - **Message ids and history:** every message gets a server-assigned id; the most recent 10,000 are kept in memory and can be paged with `HISTORY`.
 - **Session resume with exact catch-up:** a dropped connection keeps its name and rooms for 2 minutes. Reconnecting replays every message it missed from the server's log, starting after the client's last `ACK`, an explicit resume point, or what the server knows it wrote, paced so a long catch-up never overflows the connection.
 - **Agents:** any session can advertise capabilities; others send it typed requests with their own ids and get back streamed or single responses. The server enforces that answers match open requests and closes requests that time out or whose agent leaves.
+- **Browsers and Python:** an optional HTTP port serves a bundled web client and a WebSocket endpoint that carries the same frames; `sdk/python` is a dependency-free asyncio client with agent support and automatic reconnect.
 - **Optional token auth:** a `username token` file protects listed names (or, with `-A`, all of them); re-read on `SIGHUP`.
 - **Optional persistence:** with `-d chat.db`, messages go to SQLite; history pages back indefinitely and ids continue across restarts.
 - **Health:** ping/pong latency and per-session counters via `HEALTH_CHECK`.
@@ -25,6 +26,7 @@ Early but tested. The server is single-threaded on Linux epoll, handles up to 1,
 sudo apt-get install uuid-dev libsqlite3-dev
 make
 ./build/tundra_chat_server            # listens on 4242
+./build/tundra_chat_server -w 8080    # also serves the web client at http://localhost:8080/
 ./build/tundra_chat_server -d chat.db -t tokens.txt   # with persistence and token auth
 ```
 
@@ -67,12 +69,47 @@ An agent and a client that uses it:
 | `-c` | health check |
 | `-w seconds` | how long to listen afterwards (default 1) |
 
+## Python SDK
+
+`sdk/python/tundra` has no dependencies beyond the standard library:
+
+```python
+import asyncio, tundra
+
+async def main():
+    client = tundra.Client("localhost", 4242, "alice")
+    await client.connect()
+    await client.join("#dev")
+    await client.send("#dev", "hello")
+    print(await client.request("echo", "summarize this"))   # ask an agent
+    async for msg in client.messages():
+        print(msg.sender, msg.text)
+
+asyncio.run(main())
+```
+
+Writing an agent is a handler; `yield` streams partial answers:
+
+```python
+agent = tundra.Agent("localhost", 4242, "summarizer", capabilities={"skills": ["summarize"]})
+
+@agent.handler
+async def handle(req):
+    yield "working on it"
+    yield "summary of: " + req.body
+
+asyncio.run(agent.run_forever())
+```
+
+The client answers pings, acknowledges what it receives, and on a dropped connection reconnects and resumes its session, catching up on anything it missed. See `sdk/python/examples/`.
+
 ## Development
 
 ```bash
 make test                               # codec unit tests + end-to-end tests
 make asan && ./tests/integration.sh     # same, under AddressSanitizer + UBSan
 make fuzz-run FUZZ_TIME=60              # fuzz the payload codec (needs clang)
+(cd tests/web && npm install) && ./tests/web_ui.sh   # web client in jsdom (needs node)
 ```
 
 Layout:
@@ -81,7 +118,9 @@ Layout:
 |------|------|
 | `tundra_protocol.h` | wire constants, big-endian helpers, bounds-checked reader/writer |
 | `tundra_codec.{h,c}` | decode/encode for every message type |
-| `server/` | server: `net.c` (epoll, I/O), `session.c`, `rooms.c`, `msglog.c`, `store.c` (SQLite), `auth.c`, `agents.c`, `handlers.c`, `main.c` |
+| `server/` | server: `net.c` (epoll, I/O), `ws.c` (HTTP/WebSocket), `session.c`, `rooms.c`, `msglog.c`, `store.c` (SQLite), `auth.c`, `agents.c`, `handlers.c`, `main.c` |
+| `web/index.html` | bundled browser client (embedded into the server at build time) |
+| `sdk/python/` | Python SDK and examples |
 | `test_client.c` | scriptable CLI client |
 | `tests/` | codec unit tests and `integration.sh` |
 | `fuzz/` | libFuzzer target and seed corpus |
@@ -96,6 +135,7 @@ Server options:
 | Option | Meaning |
 |--------|---------|
 | `-p port` | listen port (default 4242) |
+| `-w port` | also serve the web client and WebSockets on this HTTP port |
 | `-d file` | store messages in this SQLite database |
 | `-t file` | tokens file, one `username token` per line; keep it private (`chmod 600`) |
 | `-A` | with `-t`: every username must be listed |
@@ -121,8 +161,9 @@ Compile-time constants in `server/server.h` (two have command-line overrides):
 
 ## Roadmap
 
-- Built-in TLS
-- WebSocket gateway, browser client, Python SDK
+- Built-in TLS (today: put a TLS-terminating proxy in front)
+- Persisting sessions and room membership across restarts (messages already persist with `-d`)
+- SDKs for more languages
 
 ## License
 

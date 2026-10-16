@@ -76,8 +76,11 @@ typedef struct Session {
     size_t capabilities_len;
 } Session;
 
+enum { PROTO_TCP = 0, PROTO_HTTP, PROTO_WS };
+
 typedef struct Client {
     int fd;                     /* -1 when the slot is free */
+    int proto;                  /* PROTO_*: raw Tundra, HTTP before upgrade, WebSocket */
     int dead;                   /* closed at the end of the current loop iteration */
     int close_after_flush;
     int want_write;             /* EPOLLOUT currently registered */
@@ -92,7 +95,7 @@ typedef struct Client {
     size_t marks_head;
     size_t marks_count;
     size_t in_len;
-    uint8_t in[TUNDRA_MAX_FRAME]; /* keep last: reset code clears everything before it */
+    uint8_t in[TUNDRA_MAX_FRAME + 16]; /* one frame plus a WebSocket header; keep last: reset code clears everything before it */
 } Client;
 
 typedef struct {
@@ -121,6 +124,8 @@ int valid_room_name(const uint8_t *name, size_t len);
 
 /* ---- net.c ---- */
 int net_listen(int port);
+int net_listen_ws(int port);               /* optional HTTP/WebSocket listener */
+void out_append(Client *c, const uint8_t *data, size_t len); /* raw bytes, then flush */
 void net_run(void (*tick)(void));          /* event loop; returns on shutdown */
 void net_shutdown(void);
 void mark_dead(Client *c);
@@ -233,6 +238,11 @@ void agents_expire(void);
 void agents_session_released(Session *s);
 /* An AGENT_REQUEST_IN frame was dropped from a backlog: closes its request. */
 void agents_request_dropped(const uint8_t *payload, size_t len);
+
+/* ---- ws.c ---- */
+void ws_process_input(Client *c);          /* HTTP request or WebSocket frames */
+size_t ws_header(uint8_t *hdr, size_t payload_len);
+void tundra_sha1(const uint8_t *data, size_t len, uint8_t out[20]);
 
 /* ---- handlers.c ---- */
 void handle_frame(Client *c, const uint8_t *frame, size_t payload_len);

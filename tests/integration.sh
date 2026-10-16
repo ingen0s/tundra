@@ -912,6 +912,115 @@ expect "requests dropped from a full backlog fail fast" "$TMP/agentedge.out" "dr
 expect "turning off advertising closes open requests" "$TMP/agentedge.out" "unadvertise-closes (1, 4, 1)"
 expect "an oversized agent list is marked truncated" "$TMP/agentedge.out" "list-truncated 1"
 stop_server agents3
+# 24. WebSocket gateway and web client
+PORT=$((BASE_PORT + 7))
+WSPORT=$((BASE_PORT + 8))
+start_server ws "$PORT" -w "$WSPORT"
+raw >"$TMP/ws.out" <<'PY'
+import sys, struct, socket, urllib.request, urllib.error
+from tundra_raw import *
+port = int(sys.argv[1]); wsport = port + 1
+
+w = WsConn(wsport)
+print("accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" in w.handshake)
+w.send(register(b"webuser"))
+f = w.recv_frame()
+print("ws-register", f[0] if f else None)
+
+t = Conn(port)
+t.send(register(b"tcpuser"))
+t.wait_for(0x10)
+t.send(frame(0x02, s16(b"tcp to ws")))
+f = w.wait_for(0x17)
+print("tcp-to-ws", f[1][-9:].decode() if f else None)
+w.send(frame(0x02, s16(b"ws to tcp")))
+f = t.wait_for(0x17)
+print("ws-to-tcp", f[1][-9:].decode() if f else None)
+
+big = b"z" * 60000
+w.send(frame(0x02, s16(big)))
+f = t.wait_for(0x17)
+print("ws-large", len(f[1]) if f else None)
+t.send(frame(0x02, s16(big)))
+f = w.wait_for(0x17)
+print("tcp-large-to-ws", len(f[1]) if f else None)
+
+w.sock.sendall(WsConn.ws_frame(b"hi", opcode=0x9))
+m = w.recv_ws()
+print("ping-pong", m)
+
+w.sock.sendall(WsConn.ws_frame(b"text", opcode=0x1))
+m = w.recv_ws()
+print("text-refused", m[0] if m else None, struct.unpack(">H", m[1][:2])[0] if m else None)
+
+u = WsConn(wsport)
+u.send(register(b"unmasked"))
+u.recv_frame()
+u.sock.sendall(bytes([0x82, 0x02]) + b"ab")
+m = u.recv_ws()
+while m and m[0] != 8:  # skip frames queued before the close
+    m = u.recv_ws()
+print("unmasked-refused", struct.unpack(">H", m[1][:2])[0] if m else None)
+
+body = urllib.request.urlopen("http://127.0.0.1:%d/" % wsport).read()
+print("web-client", b"<title>Tundra</title>" in body)
+try:
+    urllib.request.urlopen("http://127.0.0.1:%d/nope" % wsport)
+except urllib.error.HTTPError as e:
+    print("http-404", e.code)
+bad = WsConn(wsport, key="")
+print("bad-handshake", bad.handshake.split("\r\n")[0])
+
+# upgrade request and a large first frame in one write is not a 431
+sock = socket.create_connection(("127.0.0.1", wsport))
+sock.settimeout(2)
+req = ("GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+       "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").encode()
+reg = WsConn.ws_frame(register(b"eager"))
+pad = WsConn.ws_frame(frame(0x02, s16(b"p" * 9000)))  # a 9 KB frame before REGISTER: gets an error, then registers
+sock.sendall(req + pad + reg)
+resp = b""
+while b"\r\n\r\n" not in resp:
+    resp += sock.recv(4096)
+e = WsConn.__new__(WsConn); e.sock = sock; e.raw = resp.partition(b"\r\n\r\n")[2]; e.buf = b""
+f = e.wait_for(0x10)
+print("handshake-plus-frames", resp.split(b"\r\n")[0].decode(), f[0] if f else None)
+
+# a fragmented ping is a protocol error; a close code is echoed
+g = WsConn(wsport); g.send(register(b"fragger")); g.recv_frame()
+g.sock.sendall(WsConn.ws_frame(b"x", opcode=0x9, fin=False))
+m = g.recv_ws()
+while m and m[0] != 8:
+    m = g.recv_ws()
+print("fragmented-control", struct.unpack(">H", m[1][:2])[0] if m else None)
+h = WsConn(wsport); h.send(register(b"closer")); h.recv_frame()
+h.sock.sendall(WsConn.ws_frame(struct.pack(">H", 4001), opcode=0x8))
+m = h.recv_ws()
+while m and m[0] != 8:
+    m = h.recv_ws()
+print("close-echo", struct.unpack(">H", m[1][:2])[0] if m else None)
+PY
+expect "websocket handshake accept key" "$TMP/ws.out" "accept True"
+expect "register over websocket" "$TMP/ws.out" "ws-register 16"
+expect "chat from tcp reaches websocket" "$TMP/ws.out" "tcp-to-ws tcp to ws"
+expect "chat from websocket reaches tcp" "$TMP/ws.out" "ws-to-tcp ws to tcp"
+# CHAT payload: id 8 + ts 8 + kind 1 + "#lobby" 7 + sender 8 + len 2 + text 60000
+expect "large message from websocket" "$TMP/ws.out" "ws-large 60034"
+expect "large message to websocket" "$TMP/ws.out" "tcp-large-to-ws 60034"
+expect "websocket ping answered" "$TMP/ws.out" "ping-pong (10, b'hi')"
+expect "text messages refused with 1003" "$TMP/ws.out" "text-refused 8 1003"
+expect "unmasked client frames refused with 1002" "$TMP/ws.out" "unmasked-refused 1002"
+expect "web client served at /" "$TMP/ws.out" "web-client True"
+expect "unknown paths 404" "$TMP/ws.out" "http-404 404"
+expect "bad handshake is a 400" "$TMP/ws.out" "bad-handshake HTTP/1.1 400 Bad Request"
+expect "frames sent with the upgrade request are fine" "$TMP/ws.out" "handshake-plus-frames HTTP/1.1 101 Switching Protocols 16"
+expect "fragmented control frames are refused with 1002" "$TMP/ws.out" "fragmented-control 1002"
+expect "a close code is echoed" "$TMP/ws.out" "close-echo 4001"
+
+# 25. Python SDK
+if python3 "$ROOT/tests/sdk_test.py" "$PORT" >"$TMP/sdk.out" 2>&1; then :; else FAILED=1; fi
+cat "$TMP/sdk.out"
+stop_server ws
 
 if [ "$FAILED" -ne 0 ]; then
     for log in "$TMP"/*.log; do echo "--- $(basename "$log") ---"; tail -40 "$log"; done
