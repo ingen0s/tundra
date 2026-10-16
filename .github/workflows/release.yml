@@ -74,7 +74,7 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          [ -f build.log ] && grep -iE "error|undefined|cannot find|No such" build.log | head -25 | sed 's/^/::error title=build::/' || true
+          [ -f build.log ] && grep -v "^cc \|^mkdir\|^python" build.log | grep -v "warning: Using" | tail -30 | cut -c1-300 | sed 's/^/::error title=build::/' || true
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.NAME }}
@@ -140,7 +140,7 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          [ -f build.log ] && grep -iE "error|undefined|cannot find|No such" build.log | head -25 | sed 's/^/::error title=build::/' || true
+          [ -f build.log ] && grep -v "^cc \|^mkdir\|^python" build.log | grep -v "warning: Using" | tail -30 | cut -c1-300 | sed 's/^/::error title=build::/' || true
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.NAME }}
@@ -193,7 +193,7 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          [ -f build.log ] && grep -iE "error|undefined|cannot find|No such" build.log | head -25 | sed 's/^/::error title=build::/' || true
+          [ -f build.log ] && grep -v "^cc \|^mkdir\|^python" build.log | grep -v "warning: Using" | tail -30 | cut -c1-300 | sed 's/^/::error title=build::/' || true
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.NAME }}
