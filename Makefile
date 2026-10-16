@@ -14,6 +14,7 @@ HEADERS := tundra_protocol.h tundra_codec.h
 CODEC   := tundra_codec.c
 
 FUZZ_TIME ?= 60
+FUZZ_CC   ?= $(shell command -v clang-18 || echo clang)
 
 .PHONY: all clean test asan fuzz fuzz-run
 
@@ -42,13 +43,13 @@ test: all
 
 # libFuzzer target (needs clang).
 fuzz: | $(BUILD)
-	clang -std=c11 -g -O1 -fsanitize=fuzzer,address,undefined -o $(FUZZER) fuzz/fuzz_codec.c $(CODEC)
+	$(FUZZ_CC) -std=c11 -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined -o $(FUZZER) fuzz/fuzz_codec.c $(CODEC)
 
 # Fuzz for FUZZ_TIME seconds; new interesting inputs go to build/corpus,
 # the checked-in seeds in fuzz/corpus are only read.
 fuzz-run: fuzz
 	mkdir -p $(BUILD)/corpus
-	./$(FUZZER) $(BUILD)/corpus fuzz/corpus -max_total_time=$(FUZZ_TIME) -print_final_stats=1
+	./$(FUZZER) $(BUILD)/corpus fuzz/corpus -max_total_time=$(FUZZ_TIME) -max_len=65536 -print_final_stats=1
 
 clean:
 	rm -rf $(BUILD)

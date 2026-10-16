@@ -24,10 +24,20 @@ jobs:
         run: ./tests/integration.sh
 
   fuzz:
-    runs-on: ubuntu-latest
+    # pinned so clang and libclang-rt-18-dev stay the same version
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y clang libclang-rt-18-dev uuid-dev
+        run: sudo apt-get update && sudo apt-get install -y clang-18 libclang-rt-18-dev
       - name: Fuzz the codec for 60 seconds
         run: make fuzz-run FUZZ_TIME=60
+      - name: Keep crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            leak-*
+            timeout-*

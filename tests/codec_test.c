@@ -93,6 +93,60 @@ int main(void) {
 
     CHECK(tundra_decode(0x7f, buf, 0, &out) == TUNDRA_DECODE_UNKNOWN, "unknown type reported");
 
+    /* round trips for the remaining fixed-layout types */
+    {
+        static const uint8_t types[] = { MSG_SYSTEM, MSG_ERROR, MSG_PING, MSG_PONG, MSG_BROADCAST_AGENT };
+        for (size_t i = 0; i < sizeof(types); i++) {
+            memset(&in, 0, sizeof(in));
+            in.type = types[i];
+            in.u.system.text = str("text");          /* SYSTEM */
+            if (types[i] == MSG_ERROR) { in.u.error.code = 7; in.u.error.text = str("oops"); }
+            if (types[i] == MSG_PING) in.u.ping.ts_ms = 99;
+            if (types[i] == MSG_PONG) in.u.pong.data = str("12345678");
+            if (types[i] == MSG_BROADCAST_AGENT) { in.u.broadcast.sender = str("a"); in.u.broadcast.text = str("b c"); }
+            n = tundra_encode(&in, buf, sizeof(buf));
+            uint8_t again[64];
+            long m2 = -1;
+            if (n > 0 && tundra_decode(types[i], buf, (size_t)n, &out) == TUNDRA_DECODE_OK)
+                m2 = tundra_encode(&out, again, sizeof(again));
+            char name[64];
+            snprintf(name, sizeof(name), "%s round trip", tundra_type_name(types[i]));
+            CHECK(n > 0 && m2 == n && memcmp(buf, again, (size_t)n) == 0, name);
+        }
+    }
+
+    /* fixed-size payloads reject extra or missing bytes */
+    memset(buf, 0, 32);
+    CHECK(tundra_decode(MSG_HEALTH_CHECK, buf, 1, &out) == TUNDRA_DECODE_MALFORMED, "health check with a byte rejected");
+    CHECK(tundra_decode(MSG_PING, buf, 9, &out) == TUNDRA_DECODE_MALFORMED, "ping with an extra byte rejected");
+    CHECK(tundra_decode(MSG_HEALTH_RESULT, buf, 24, &out) == TUNDRA_DECODE_MALFORMED &&
+          tundra_decode(MSG_HEALTH_RESULT, buf, 26, &out) == TUNDRA_DECODE_MALFORMED, "health result must be 25 bytes");
+
+    /* empty payloads: only the types without fields accept them */
+    {
+        static const uint8_t needs_fields[] = { MSG_REGISTER, MSG_MESSAGE, MSG_AGENT_COMMAND, MSG_SYSTEM,
+                                                MSG_BROADCAST_MESSAGE, MSG_PING, MSG_ERROR, MSG_HEALTH_RESULT };
+        int ok = 1;
+        for (size_t i = 0; i < sizeof(needs_fields); i++) {
+            if (tundra_decode(needs_fields[i], buf, 0, &out) != TUNDRA_DECODE_MALFORMED) ok = 0;
+        }
+        CHECK(ok, "empty payloads rejected where fields are required");
+        CHECK(tundra_decode(MSG_HEALTH_CHECK, buf, 0, &out) == TUNDRA_DECODE_OK &&
+              tundra_decode(MSG_PONG, buf, 0, &out) == TUNDRA_DECODE_OK, "empty payloads accepted where allowed");
+    }
+
+    /* encoder limits: str16 over 65535 bytes, unknown type */
+    {
+        static uint8_t huge[70000];
+        memset(&in, 0, sizeof(in));
+        in.type = MSG_MESSAGE;
+        in.u.message.text.p = huge;
+        in.u.message.text.len = sizeof(huge);
+        CHECK(tundra_encode(&in, buf, sizeof(buf)) == -1, "str16 longer than 65535 refused");
+        in.type = 0x7f;
+        CHECK(tundra_encode(&in, buf, sizeof(buf)) == -1, "unknown type refused by encoder");
+    }
+
     if (failures) {
         printf("%d codec test(s) failed\n", failures);
         return 1;
