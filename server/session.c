@@ -52,7 +52,7 @@ Session *alloc_session(void) {
             memset(s, 0, sizeof(*s));
             return s;
         }
-        if (s->state == SESSION_DETACHED && (!oldest || s->detached_at < oldest->detached_at)) oldest = s;
+        if (s->state == SESSION_DETACHED && (!oldest || s->detached_at_ms < oldest->detached_at_ms)) oldest = s;
     }
     if (!oldest) return NULL;
     release_session(oldest);
@@ -70,7 +70,7 @@ void detach(Client *c) {
     Session *s = c->session;
     if (!s) return;
     s->state = SESSION_DETACHED;
-    s->detached_at = mono_s();
+    s->detached_at_ms = mono_ms();
     s->client = NULL;
     c->session = NULL;
 }
@@ -167,7 +167,7 @@ void sessions_expire(void) {
     }
     for (int i = 0; i < MAX_SESSIONS; i++) {
         Session *s = &sessions[i];
-        if (s->state == SESSION_DETACHED && now - s->detached_at > resume_grace) release_session(s);
+        if (s->state == SESSION_DETACHED && mono_ms() - s->detached_at_ms > (uint64_t)resume_grace * 1000u) release_session(s);
     }
 }
 

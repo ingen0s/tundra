@@ -42,7 +42,7 @@ typedef struct Session {
     char username[TUNDRA_MAX_USERNAME + 1];
     struct Client *client;      /* set only while ACTIVE */
     time_t connected_at;
-    time_t detached_at;
+    uint64_t detached_at_ms;    /* monotonic; ms so eviction order has no ties */
     uint16_t out_seq;           /* sequence counter for server-initiated frames */
     /* Frames waiting for this session, oldest first. Filled while the
      * session is detached, and while an earlier backlog is still being
