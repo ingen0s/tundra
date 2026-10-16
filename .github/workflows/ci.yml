@@ -71,6 +71,8 @@ jobs:
         run: make all CFLAGS="-O1 -g -DTUNDRA_POLLER_POLL" SANFLAGS="-fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=all"
       - name: Integration tests
         run: ./tests/integration.sh
+      - name: Smoke test (120 clients, slow reader)
+        run: python3 tests/smoke.py build/tundra_chat_server
 
   macos:
     runs-on: macos-latest

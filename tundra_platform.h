@@ -38,6 +38,9 @@ void plat_cleanup(void);
  * (POSIX only). Both are called from a signal or console handler, so they
  * must only set a flag. */
 void plat_handle_signals(void (*on_stop)(void), void (*on_reload)(void));
+/* Call last in main: lets a Windows console-close handler that is waiting
+ * for a clean shutdown return. */
+void plat_shutdown_complete(void);
 
 /* ---- sockets ---- */
 

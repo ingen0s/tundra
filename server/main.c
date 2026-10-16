@@ -1,11 +1,12 @@
 #include <getopt.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #include "server.h"
 
 static time_t last_ping;
-static volatile int reload_requested = 0;
+static atomic_int reload_requested = 0; /* set from a signal handler */
 
 static void on_hup(void) {
     reload_requested = 1;
@@ -95,6 +96,7 @@ int main(int argc, char **argv) {
         free(sessions[i].capabilities);
     }
     msglog_free();
+    plat_shutdown_complete();
     store_close();
     tls_free();
     auth_free();

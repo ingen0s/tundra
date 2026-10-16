@@ -17,7 +17,7 @@ endif
 ifeq ($(OS),Windows_NT)
   EXE      := .exe
   NET_LIBS := -lws2_32 -lbcrypt
-  override CFLAGS += -D__USE_MINGW_ANSI_STDIO=1
+  override CFLAGS += -D__USE_MINGW_ANSI_STDIO=1 -D_WIN32_WINNT=0x0600
 else
   EXE      :=
   NET_LIBS :=
