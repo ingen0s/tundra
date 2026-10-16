@@ -24,6 +24,7 @@ A frame is always exactly `7 + length` bytes, so the largest frame is 65542 byte
 ## Transports
 
 - **TCP** (default port 4242): frames are written back to back on the stream.
+- **TLS**: when the server runs with `-C cert -K key`, both ports speak TLS 1.2 or later and carry exactly the same bytes inside it (Tundra frames on the main port, HTTP and WebSocket on the web port, so `https://` and `wss://`). A port is either all TLS or all plaintext.
 - **WebSocket** (`-w PORT`, path `/ws`): each binary WebSocket message carries exactly one Tundra frame, in both directions. Client messages must be unfragmented binary messages (what browsers send) holding exactly one complete frame. The server closes the connection with 1003 for text or continuation frames, 1002 for unmasked frames, extension bits, fragmented or oversized control frames and malformed close frames, 1007 for a binary message that is fragmented or is not exactly one frame, and 1009 for messages larger than one frame. A close from the client is answered with the same code. HTTP request headers are limited to 8 KiB. WebSocket ping/pong is answered, but the Tundra `PING`/`PONG` still applies. The same port serves the bundled web client at `/`.
 
 ## Field notation
@@ -99,9 +100,9 @@ After the username, `REGISTER` may carry any number of extensions, each `u8 tag`
 
 ## Authentication
 
-Authentication is optional and configured on the server with a tokens file of `username token` lines (`-t`). A username listed there can only register with its token in the `TOKEN` extension; a missing or wrong token gets `UNAUTHORIZED` and the connection is closed. Names not in the file are open unless the server runs with `-A`, which requires every username to be listed. Resuming a session needs only its session id, which is itself a 122-bit secret. Tokens travel in clear text, so use TLS (for now, a TLS-terminating proxy) on untrusted networks.
+Authentication is optional and configured on the server with a tokens file of `username token` lines (`-t`). A username listed there can only register with its token in the `TOKEN` extension; a missing or wrong token gets `UNAUTHORIZED` and the connection is closed. Names not in the file are open unless the server runs with `-A`, which requires every username to be listed. Resuming a session needs only its session id, which is itself a 122-bit secret. Tokens travel in clear text, so use TLS (`-C`/`-K`, or a TLS-terminating proxy) on untrusted networks.
 
-The file is re-read on `SIGHUP`. Loading fails closed: a file with any malformed line, a duplicate name, a token over 256 characters, or no entries at all is rejected as a whole; at startup the server refuses to start, and on reload the previous tokens stay in force. After a successful reload, sessions whose name no longer accepts the token they registered with are ended (`UNAUTHORIZED`, then disconnected).
+The file is re-read on `SIGHUP` (Linux and macOS; Windows has no SIGHUP, so restart the server there). Loading fails closed: a file with any malformed line, a duplicate name, a token over 256 characters, or no entries at all is rejected as a whole; at startup the server refuses to start, and on reload the previous tokens stay in force. After a successful reload, sessions whose name no longer accepts the token they registered with are ended (`UNAUTHORIZED`, then disconnected).
 
 ## Sessions
 

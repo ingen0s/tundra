@@ -4,7 +4,7 @@
 
 #include "server.h"
 
-static const uuid_t nil_uuid = {0};
+static const tundra_uuid_t nil_uuid = {0};
 
 static TundraBytes cstr(const char *s) {
     TundraBytes b = { (const uint8_t *)s, strlen(s) };
@@ -29,7 +29,7 @@ static void handle_register(Client *c, uint16_t seq, const TundraMsg *m) {
     username[uname.len] = '\0';
 
     /* Resume: a non-nil id must match a live session for the same user. */
-    if (uuid_compare(m->u.reg.id, nil_uuid) != 0) {
+    if (!tundra_uuid_is_null(m->u.reg.id)) {
         Session *s = find_session_by_id(m->u.reg.id);
         if (!s || strcmp(s->username, username) != 0) {
             send_error(c, seq, ERR_SESSION_EXPIRED, "Session expired or unknown; register with a zero id");
@@ -97,7 +97,7 @@ static void handle_register(Client *c, uint16_t seq, const TundraMsg *m) {
         close_after_flush(c);
         return;
     }
-    uuid_generate(s->id);
+    tundra_uuid_generate(s->id);
     s->start_id = s->written_id = msglog_last_id();
     if (has_token && token.len <= sizeof(s->auth_token)) {
         memcpy(s->auth_token, token.p, token.len);

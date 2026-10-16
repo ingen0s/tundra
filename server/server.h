@@ -4,7 +4,12 @@
 
 #include <stdint.h>
 #include <time.h>
-#include <uuid/uuid.h>
+#include "../tundra_platform.h"
+
+#ifdef _WIN32
+#define strcasecmp _stricmp
+#define strncasecmp _strnicmp
+#endif
 
 #include "../tundra_codec.h"
 
@@ -44,7 +49,7 @@ struct Client;
 
 typedef struct Session {
     SessionState state;
-    uuid_t id;
+    tundra_uuid_t id;
     char username[TUNDRA_MAX_USERNAME + 1];
     struct Client *client;      /* set only while ACTIVE */
     time_t connected_at;
@@ -79,7 +84,11 @@ typedef struct Session {
 enum { PROTO_TCP = 0, PROTO_HTTP, PROTO_WS };
 
 typedef struct Client {
-    int fd;                     /* -1 when the slot is free */
+    int fd;                     /* slot number for logs; -1 when the slot is free */
+    tsock_t sock;
+    void *ssl;                  /* SSL* when the listener uses TLS */
+    int tls_wants_write;        /* OpenSSL needs the socket writable to continue */
+    int tls_failed;             /* fatal TLS error: skip close_notify */
     int proto;                  /* PROTO_*: raw Tundra, HTTP before upgrade, WebSocket */
     int dead;                   /* closed at the end of the current loop iteration */
     int close_after_flush;
@@ -114,8 +123,13 @@ extern int idle_timeout;
 extern int resume_grace;
 
 /* ---- util.c ---- */
-void log_info(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-void log_debug(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+#if defined(__MINGW32__)
+#define TUNDRA_PRINTF_FMT gnu_printf /* C99 stdio via __USE_MINGW_ANSI_STDIO */
+#else
+#define TUNDRA_PRINTF_FMT printf
+#endif
+void log_info(const char *fmt, ...) __attribute__((format(TUNDRA_PRINTF_FMT, 1, 2)));
+void log_debug(const char *fmt, ...) __attribute__((format(TUNDRA_PRINTF_FMT, 1, 2)));
 uint64_t wall_ms(void);
 uint64_t mono_ms(void);
 time_t mono_s(void);
@@ -126,7 +140,9 @@ int valid_room_name(const uint8_t *name, size_t len);
 int net_listen(int port);
 int net_listen_ws(int port);               /* optional HTTP/WebSocket listener */
 void out_append(Client *c, const uint8_t *data, size_t len); /* raw bytes, then flush */
-void net_run(void (*tick)(void));          /* event loop; returns on shutdown */
+void net_run(void (*tick)(void));                          /* event loop; returns on shutdown */
+/* Ctrl+C / SIGINT / SIGTERM stop net_run; SIGHUP calls on_reload (POSIX). */
+void net_handle_signals(void (*on_reload)(void));
 void net_shutdown(void);
 void mark_dead(Client *c);
 void close_after_flush(Client *c);
@@ -138,11 +154,11 @@ void push_frame(Client *c, uint8_t type, const uint8_t *payload, size_t len);
 void send_msg(Client *c, const TundraMsg *msg, uint16_t seq, int push);
 void send_error(Client *c, uint16_t seq, uint16_t code, const char *text);
 size_t build_error(uint8_t *buf, size_t cap, uint16_t code, const char *text);
-void send_system(Client *c, uint16_t seq, const uuid_t id, const char *text);
+void send_system(Client *c, uint16_t seq, const tundra_uuid_t id, const char *text);
 
 /* ---- session.c ---- */
 int session_index(const Session *s);
-Session *find_session_by_id(const uuid_t id);
+Session *find_session_by_id(const tundra_uuid_t id);
 Session *find_session_by_name(const char *name);
 Session *find_session_by_bytes(TundraBytes name);
 Session *alloc_session(void); /* may release the longest-detached session */
@@ -238,6 +254,17 @@ void agents_expire(void);
 void agents_session_released(Session *s);
 /* An AGENT_REQUEST_IN frame was dropped from a backlog: closes its request. */
 void agents_request_dropped(const uint8_t *payload, size_t len);
+
+/* ---- tls.c ---- */
+int tls_available(void);                  /* built with OpenSSL */
+int tls_enabled(void);                    /* certificate loaded */
+int tls_init(const char *cert, const char *key);
+void tls_free(void);
+int tls_attach(Client *c);                /* on accept, when enabled */
+void tls_detach(Client *c);
+long tls_recv(Client *c, void *buf, size_t len); /* >0, 0 closed, -1 retry, -2 error */
+long tls_send(Client *c, const void *buf, size_t len); /* >0, -1 retry, -2 error */
+int tls_pending(const Client *c);         /* decrypted bytes waiting inside OpenSSL */
 
 /* ---- ws.c ---- */
 void ws_process_input(Client *c);          /* HTTP request or WebSocket frames */

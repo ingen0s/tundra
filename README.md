@@ -4,7 +4,7 @@ A small, fast chat server in C with a compact binary protocol. Rooms, direct mes
 
 ## Status
 
-Early but tested. The server is single-threaded on Linux epoll, handles up to 1,000 connections, and every change runs through unit tests, end-to-end tests, AddressSanitizer/UBSan and a fuzzer in CI. There is no built-in TLS yet, so on untrusted networks put it behind a TLS-terminating proxy.
+Early but tested. The server is single-threaded and event-driven (epoll on Linux, kqueue on macOS, WSAPoll on Windows), handles up to 1,000 connections, and runs natively on all three. Every change runs through unit tests, end-to-end tests, AddressSanitizer/UBSan, a fuzzer, and build-and-test jobs on Linux, macOS and Windows in CI. Optional built-in TLS (OpenSSL, when found at build time) covers both the Tundra port and the web port.
 
 ## Features
 
@@ -15,19 +15,30 @@ Early but tested. The server is single-threaded on Linux epoll, handles up to 1,
 - **Session resume with exact catch-up:** a dropped connection keeps its name and rooms for 2 minutes. Reconnecting replays every message it missed from the server's log, starting after the client's last `ACK`, an explicit resume point, or what the server knows it wrote, paced so a long catch-up never overflows the connection.
 - **Agents:** any session can advertise capabilities; others send it typed requests with their own ids and get back streamed or single responses. The server enforces that answers match open requests and closes requests that time out or whose agent leaves.
 - **Browsers, Python and TypeScript:** an optional HTTP port serves a bundled web client and a WebSocket endpoint that carries the same frames; `sdk/python` is a dependency-free asyncio client and `sdk/typescript` a dependency-free client for Node and browsers, both with agent support and automatic reconnect.
-- **Optional token auth:** a `username token` file protects listed names (or, with `-A`, all of them); re-read on `SIGHUP`.
+- **Optional token auth:** a `username token` file protects listed names (or, with `-A`, all of them); re-read on `SIGHUP` (Linux and macOS; on Windows, restart the server).
 - **Optional persistence:** with `-d chat.db`, messages go to SQLite; history pages back indefinitely and ids continue across restarts.
 - **Health:** ping/pong latency and per-session counters via `HEALTH_CHECK`.
 - **Backpressure:** each client's outgoing queue is capped at 1 MiB; clients that can't keep up are disconnected instead of stalling the server.
 
 ## Quick start
 
+Build (SQLite is required; OpenSSL is optional and turns on TLS):
+
+| Platform | Steps |
+|----------|-------|
+| Linux | `sudo apt-get install libsqlite3-dev libssl-dev`, then `make` |
+| macOS | `xcode-select --install` (SQLite ships with macOS); for TLS `brew install openssl@3 pkg-config` and build with `PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig" make`, otherwise just `make` |
+| Windows | Install [MSYS2](https://www.msys2.org/), open the **MINGW64** shell, `pacman -S make mingw-w64-x86_64-gcc mingw-w64-x86_64-sqlite3 mingw-w64-x86_64-openssl mingw-w64-x86_64-pkgconf`, then `make` (binaries end in `.exe`) |
+
+The build finds OpenSSL through `pkg-config`; `make TLS=0` leaves TLS out.
+
+Run:
+
 ```bash
-sudo apt-get install uuid-dev libsqlite3-dev
-make
 ./build/tundra_chat_server            # listens on 4242
 ./build/tundra_chat_server -w 8080    # also serves the web client at http://localhost:8080/
 ./build/tundra_chat_server -d chat.db -t tokens.txt   # with persistence and token auth
+./build/tundra_chat_server -w 8443 -C cert.pem -K key.pem   # TLS on both ports (https/wss on 8443)
 ```
 
 In two more terminals:
@@ -56,6 +67,7 @@ An agent and a client that uses it:
 | `-f id` | with `-r`: replay everything after this message id |
 | `-a` | acknowledge every chat message received |
 | `-k token` | authentication token for this username |
+| `-s` / `-x` | connect with TLS / skip certificate verification (testing only) |
 | `-G caps` | advertise as an agent with these capabilities |
 | `-q agent:body` | send an agent request |
 | `-Q` | list agents |
@@ -87,6 +99,8 @@ async def main():
 
 asyncio.run(main())
 ```
+
+For a TLS server pass `ssl=True` (system trust store) or an `ssl.SSLContext`, for example `tundra.Client(host, 4242, "alice", ssl=True)`.
 
 Writing an agent is a handler; `yield` streams partial answers:
 
@@ -134,6 +148,7 @@ make test                               # codec unit tests + end-to-end tests
 make asan && ./tests/integration.sh     # same, under AddressSanitizer + UBSan
 make fuzz-run FUZZ_TIME=60              # fuzz the payload codec (needs clang)
 (cd tests/web && npm install) && ./tests/web_ui.sh   # web client in jsdom (needs node)
+python3 tests/smoke.py build/tundra_chat_server     # cross-platform smoke test (also runs on Windows)
 ./tests/ts_sdk.sh                       # TypeScript SDK against a live server (needs node 22)
 ```
 
@@ -143,6 +158,7 @@ Layout:
 |------|------|
 | `tundra_protocol.h` | wire constants, big-endian helpers, bounds-checked reader/writer |
 | `tundra_codec.{h,c}` | decode/encode for every message type |
+| `tundra_platform.{h,c}` | sockets, poller (epoll / kqueue / poll), clocks, randomness, UUIDs, signals for Linux, macOS and Windows |
 | `server/` | server: `net.c` (epoll, I/O), `ws.c` (HTTP/WebSocket), `session.c`, `rooms.c`, `msglog.c`, `store.c` (SQLite), `auth.c`, `agents.c`, `handlers.c`, `main.c` |
 | `web/index.html` | bundled browser client (embedded into the server at build time) |
 | `sdk/python/` | Python SDK and examples |
@@ -162,6 +178,7 @@ Server options:
 |--------|---------|
 | `-p port` | listen port (default 4242) |
 | `-w port` | also serve the web client and WebSockets on this HTTP port |
+| `-C file` / `-K file` | TLS certificate chain and private key (PEM); together they turn on TLS for both ports, so the web port serves `https://` and `wss://` |
 | `-d file` | store messages in this SQLite database |
 | `-t file` | tokens file, one `username token` per line; keep it private (`chmod 600`) |
 | `-A` | with `-t`: every username must be listed |
@@ -187,7 +204,6 @@ Compile-time constants in `server/server.h` (two have command-line overrides):
 
 ## Roadmap
 
-- Built-in TLS (today: put a TLS-terminating proxy in front)
 - Persisting sessions and room membership across restarts (messages already persist with `-d`)
 - SDKs for more languages (Python and TypeScript exist today)
 

@@ -19,6 +19,8 @@
  *   -f id         with -r: resume from this message id instead of the server's watermark
  *   -a            acknowledge every CHAT received
  *   -k token      authentication token for this username
+ *   -s            connect with TLS (verifies the certificate against system CAs)
+ *   -x            with -s, skip certificate verification (self-signed test setups)
  *   -E            act as an echo agent: answer every request with "echo: <body>"
  *   -S            with -E, stream: send a partial "working" response first
  * Then everything received is printed for -w seconds (default 1). PINGs are
@@ -36,18 +38,19 @@
  *   HIST 12 #lobby alice hello
  *   ERROR 6 No such room
  */
-#define _GNU_SOURCE
-#include <errno.h>
 #include <getopt.h>
-#include <netdb.h>
-#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <time.h>
-#include <unistd.h>
-#include <uuid/uuid.h>
+
+#include "tundra_platform.h"
+
+#ifdef TUNDRA_TLS
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+static SSL_CTX *tls_ctx = NULL;
+static SSL *tls = NULL;
+#endif
 
 #include "tundra_codec.h"
 
@@ -59,9 +62,11 @@ typedef struct {
     const char *target; /* for 'm' */
 } Action;
 
-static int sock = -1;
+static tsock_t sock = TSOCK_INVALID;
 static int auto_ack = 0;
 static int echo_agent = 0;
+static int use_tls = 0;
+static int insecure = 0;
 static int stream_agent = 0;
 static uint64_t next_req_id = 1;
 static uint16_t next_seq = 0;
@@ -69,9 +74,7 @@ static uint8_t inbuf[TUNDRA_MAX_FRAME];
 static size_t inlen = 0;
 
 static long now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+    return (long)plat_mono_ms();
 }
 
 static TundraBytes str(const char *s) {
@@ -79,11 +82,48 @@ static TundraBytes str(const char *s) {
     return b;
 }
 
+static int io_tls(void) {
+#ifdef TUNDRA_TLS
+    return tls != NULL;
+#else
+    return 0;
+#endif
+}
+
+static long io_send(const void *buf, size_t len) {
+#ifdef TUNDRA_TLS
+    if (tls) {
+        int r = SSL_write(tls, buf, (int)(len > 0x7fffffff ? 0x7fffffff : len));
+        return r > 0 ? r : -1;
+    }
+#endif
+    return plat_send(sock, buf, len);
+}
+
+static long io_recv(void *buf, size_t len) {
+#ifdef TUNDRA_TLS
+    if (tls) {
+        int r = SSL_read(tls, buf, (int)(len > 0x7fffffff ? 0x7fffffff : len));
+        if (r > 0) return r;
+        int e = SSL_get_error(tls, r);
+        return (e == SSL_ERROR_ZERO_RETURN || (e == SSL_ERROR_SYSCALL && r == 0)) ? 0 : -1;
+    }
+#endif
+    return plat_recv(sock, buf, len);
+}
+
+static int io_pending(void) {
+#ifdef TUNDRA_TLS
+    if (tls) return SSL_pending(tls) > 0;
+#endif
+    return 0;
+}
+
 static int send_all(const uint8_t *buf, size_t len) {
     while (len > 0) {
-        ssize_t n = send(sock, buf, len, MSG_NOSIGNAL);
+        long n = io_send(buf, len);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (!io_tls() && plat_interrupted()) continue;
             return -1;
         }
         buf += n;
@@ -127,9 +167,9 @@ static int handle_frame(const uint8_t *frame, size_t plen) {
 
     switch (type) {
         case MSG_SYSTEM:
-            if (!uuid_is_null(m.u.system.id)) {
+            if (!tundra_uuid_is_null(m.u.system.id)) {
                 char s[37];
-                uuid_unparse_lower(m.u.system.id, s);
+                tundra_uuid_unparse(m.u.system.id, s);
                 printf("SESSION %s\n", s);
             }
             printf("SYSTEM %.*s\n", (int)m.u.system.text.len, (const char *)m.u.system.text.p);
@@ -264,45 +304,21 @@ static int pump(long deadline, int until_type) {
 
         long wait = deadline - now_ms();
         if (wait <= 0) return 0;
-        struct pollfd pfd = { sock, POLLIN, 0 };
-        int pr = poll(&pfd, 1, (int)wait);
-        if (pr < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
+        int pr = io_pending() ? 1 : plat_wait_readable(sock, (int)wait);
+        if (pr < 0) return -1;
         if (pr == 0) return 0;
-        ssize_t n = recv(sock, inbuf + inlen, sizeof(inbuf) - inlen, 0);
+        long n = io_recv(inbuf + inlen, sizeof(inbuf) - inlen);
         if (n == 0) {
             printf("CLOSED\n");
             fflush(stdout);
             return -1;
         }
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (plat_interrupted()) continue;
             return -1;
         }
         inlen += (size_t)n;
     }
-}
-
-static int connect_to(const char *host, const char *port) {
-    struct addrinfo hints = {0}, *res, *ai;
-    hints.ai_socktype = SOCK_STREAM;
-    int rc = getaddrinfo(host, port, &hints, &res);
-    if (rc != 0) {
-        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rc));
-        return -1;
-    }
-    int fd = -1;
-    for (ai = res; ai; ai = ai->ai_next) {
-        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) continue;
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
-        close(fd);
-        fd = -1;
-    }
-    freeaddrinfo(res);
-    return fd;
 }
 
 static int run_action(const Action *a) {
@@ -351,7 +367,11 @@ static int run_action(const Action *a) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "usage: %s -u username [-H host] [-p port] [-k token] [-r session-id [-f last-id]] [-a]\n"
+            "usage: %s -u username [-H host] [-p port]"
+#ifdef TUNDRA_TLS
+            " [-s [-x]]"
+#endif
+            " [-k token] [-r session-id [-f last-id]] [-a]\n"
             "          [-j #room] [-L #room] [-t target] [-m text] [-R] [-W #room] [-y #room] [-c]\n"
             "          [-G capabilities] [-q agent:body] [-Q] [-E [-S]]\n"
             "          [-w seconds]\n",
@@ -371,7 +391,7 @@ int main(int argc, char **argv) {
     double wait_s = 1.0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "H:p:u:r:f:ak:ESj:L:t:m:RW:y:cG:q:Qw:h")) != -1) {
+    while ((opt = getopt(argc, argv, "H:p:u:r:f:ak:ESsxj:L:t:m:RW:y:cG:q:Qw:h")) != -1) {
         switch (opt) {
             case 'H': host = optarg; break;
             case 'p': port = optarg; break;
@@ -381,6 +401,8 @@ int main(int argc, char **argv) {
             case 'a': auto_ack = 1; break;
             case 'k': token = optarg; break;
             case 'E': echo_agent = 1; break;
+            case 's': use_tls = 1; break;
+            case 'x': insecure = 1; break;
             case 'S': stream_agent = 1; break;
             case 't': target = optarg; break;
             case 'w': wait_s = atof(optarg); break;
@@ -404,7 +426,7 @@ int main(int argc, char **argv) {
     memset(&reg, 0, sizeof(reg));
     reg.type = MSG_REGISTER;
     reg.u.reg.username = str(user);
-    if (resume && uuid_parse(resume, reg.u.reg.id) != 0) {
+    if (resume && tundra_uuid_parse(resume, reg.u.reg.id) != 0) {
         fprintf(stderr, "invalid session id: %s\n", resume);
         return 2;
     }
@@ -423,10 +445,46 @@ int main(int argc, char **argv) {
     reg.u.reg.ext.p = ext;
     reg.u.reg.ext.len = xw.len;
 
-    sock = connect_to(host, port);
-    if (sock < 0) {
+    if (plat_init() != 0) {
+        fprintf(stderr, "cannot start networking\n");
+        return 1;
+    }
+    sock = plat_connect(host, port);
+    if (sock == TSOCK_INVALID) {
         fprintf(stderr, "could not connect to %s:%s\n", host, port);
         return 1;
+    }
+    if (use_tls) {
+#ifdef TUNDRA_TLS
+        tls_ctx = SSL_CTX_new(TLS_client_method());
+        if (!tls_ctx) {
+            fprintf(stderr, "cannot create a TLS context\n");
+            return 1;
+        }
+        SSL_CTX_set_min_proto_version(tls_ctx, TLS1_2_VERSION);
+        if (insecure) {
+            SSL_CTX_set_verify(tls_ctx, SSL_VERIFY_NONE, NULL);
+        } else {
+            SSL_CTX_set_default_verify_paths(tls_ctx);
+            SSL_CTX_set_verify(tls_ctx, SSL_VERIFY_PEER, NULL);
+        }
+        tls = SSL_new(tls_ctx);
+        if (!tls || SSL_set_fd(tls, (int)sock) != 1) {
+            fprintf(stderr, "cannot set up TLS on the connection\n");
+            return 1;
+        }
+        SSL_set_tlsext_host_name(tls, host);
+        if (!insecure) SSL_set1_host(tls, host);
+        if (SSL_connect(tls) != 1) {
+            char err[256];
+            ERR_error_string_n(ERR_get_error(), err, sizeof(err));
+            fprintf(stderr, "TLS handshake failed: %s\n", err);
+            return 1;
+        }
+#else
+        fprintf(stderr, "this build has no TLS support\n");
+        return 2;
+#endif
     }
 
     if (send_msg(&reg) < 0) {
@@ -436,7 +494,7 @@ int main(int argc, char **argv) {
     int t = pump(now_ms() + 5000, MSG_SYSTEM);
     if (t != MSG_SYSTEM) {
         if (t == 0) fprintf(stderr, "no reply to register\n");
-        close(sock);
+        plat_close(sock);
         return 1;
     }
 
@@ -448,6 +506,6 @@ int main(int argc, char **argv) {
     }
 
     pump(now_ms() + (long)(wait_s * 1000), -1);
-    close(sock);
+    plat_close(sock);
     return 0;
 }
