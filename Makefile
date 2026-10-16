@@ -73,7 +73,7 @@ $(CLIENT): test_client.c $(CODEC) $(PLATFORM) $(HEADERS) | $(BUILD)
 	$(CC) $(CFLAGS) $(TLS_CFLAGS) $(VERSION_FLAG) -o $@ test_client.c $(CODEC) tundra_platform.c $(LDFLAGS) $(TLS_LIBS) $(LDLIBS) $(NET_LIBS)
 
 $(CODEC_T): tests/codec_test.c $(CODEC) $(HEADERS) | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/codec_test.c $(CODEC)
+	$(CC) $(CFLAGS) -o $@ tests/codec_test.c $(CODEC) $(LDFLAGS)
 
 # Build with AddressSanitizer and UndefinedBehaviorSanitizer.
 asan:
