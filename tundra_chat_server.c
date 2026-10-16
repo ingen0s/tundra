@@ -1,543 +1,757 @@
+#define _GNU_SOURCE
+#include <errno.h>
+#include <getopt.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <sys/epoll.h>
-#include <errno.h>
+#include <sys/socket.h>
 #include <time.h>
+#include <unistd.h>
 #include <uuid/uuid.h>
-#include <zlib.h>
 
-#define PORT 4242
-#define MAX_CLIENTS 1000
-#define MAX_MESSAGE_SIZE 65535
-#define MAX_USERNAME_LEN 32
-#define SESSION_TIMEOUT 120 // 2 minutes
-#define PING_INTERVAL 30 // 30 seconds
-#define MAX_BUFFERED_MESSAGES 50
+#include "tundra_protocol.h"
 
-// Message types
-enum MessageType {
-    MSG_REGISTER = 0x01,
-    MSG_MESSAGE = 0x02,
-    MSG_AGENT_COMMAND = 0x03,
-    MSG_PONG = 0x04,
-    MSG_HEALTH_CHECK = 0x05,
-    MSG_SYSTEM = 0x10,
-    MSG_BROADCAST_MESSAGE = 0x11,
-    MSG_BROADCAST_AGENT = 0x12,
-    MSG_IMAGE = 0x13,
-    MSG_PING = 0x14,
-    MSG_ERROR = 0x15,
-    MSG_HEALTH_RESULT = 0x16
-};
+#define DEFAULT_PORT          4242
+#define MAX_CLIENTS           1000
+#define MAX_SESSIONS          MAX_CLIENTS
+#define IDLE_TIMEOUT          120       /* seconds without any frame before a connection is dropped */
+#define RESUME_GRACE          120       /* seconds a disconnected session is held for reconnect */
+#define PING_INTERVAL         30        /* seconds */
+#define MAX_BUFFERED_MESSAGES 50        /* per disconnected session; oldest dropped first */
+#define MAX_OUTBOUND_BYTES    (1 << 20) /* per client; slower clients are disconnected */
+#define MAX_EVENTS            64
 
-// Error codes
-enum ErrorCode {
-    ERR_USERNAME_TAKEN = 0x0001,
-    ERR_INVALID_FORMAT = 0x0002,
-    ERR_SESSION_EXPIRED = 0x0003,
-    ERR_SERVER_ERROR = 0x0004
-};
+typedef enum { SESSION_FREE = 0, SESSION_ACTIVE, SESSION_DETACHED } SessionState;
 
-// Session structure
 typedef struct {
-    uuid_t connection_id;
-    char username[MAX_USERNAME_LEN + 1];
+    uint8_t type;
+    uint8_t *payload;
+    size_t len;
+} BufferedFrame;
+
+struct Client;
+
+typedef struct Session {
+    SessionState state;
+    uuid_t id;
+    char username[TUNDRA_MAX_USERNAME + 1];
+    struct Client *client;      /* set only while ACTIVE */
     time_t connected_at;
-    time_t last_seen;
-    int active;
-    char *message_buffer[MAX_BUFFERED_MESSAGES];
-    size_t buffer_sizes[MAX_BUFFERED_MESSAGES];
-    int buffer_count;
-    int fd; // Associated socket
-    uint16_t last_seq; // Last sequence number
-    time_t last_ping;
-    time_t last_pong;
-    uint32_t latency;
+    time_t detached_at;
+    uint16_t out_seq;           /* sequence counter for server-initiated frames */
+    BufferedFrame backlog[MAX_BUFFERED_MESSAGES];
+    size_t backlog_head;        /* index of oldest entry */
+    size_t backlog_count;
+    uint32_t latency_ms;
     uint32_t messages_sent;
     uint32_t messages_received;
-    uint32_t errors;
 } Session;
 
-// Client structure
-typedef struct {
-    int fd;
+typedef struct Client {
+    int fd;                     /* -1 when the slot is free */
+    int dead;                   /* closed at the end of the current loop iteration */
+    int close_after_flush;
+    int want_write;             /* EPOLLOUT currently registered */
     Session *session;
-    char buffer[MAX_MESSAGE_SIZE];
-    size_t buffer_pos;
+    time_t last_seen;
+    uint64_t ping_sent_ms;
+    uint8_t *out;
+    size_t out_len;
+    size_t out_cap;
+    size_t in_len;
+    uint8_t in[TUNDRA_MAX_FRAME]; /* keep last: reset code clears everything before it */
 } Client;
 
-// Global state
-Client clients[MAX_CLIENTS];
-Session sessions[MAX_CLIENTS];
-int session_count = 0;
-int epoll_fd;
-int server_fd;
+static Client clients[MAX_CLIENTS];
+static Session sessions[MAX_SESSIONS];
+static int epoll_fd = -1;
+static int server_fd = -1;
+static int verbose = 0;
+static volatile sig_atomic_t running = 1;
 
-// Utility to send a message
-int send_message(int fd, uint8_t type, uint16_t seq, const char *payload, size_t payload_len) {
-    if (payload_len > MAX_MESSAGE_SIZE - 7) {
-        fprintf(stderr, "Error: Payload too large: %zu bytes\n", payload_len);
-        return -1;
+/* Marker stored in epoll data.ptr for the listening socket. */
+static int listen_marker;
+
+static const uuid_t nil_uuid = {0};
+
+/* ------------------------------------------------------------------ */
+/* utilities                                                           */
+
+static void log_info(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
+static void log_debug(const char *fmt, ...) {
+    if (!verbose) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
+static uint64_t wall_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static uint64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static time_t mono_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec;
+}
+
+static void on_signal(int sig) {
+    (void)sig;
+    running = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* client output                                                       */
+
+static void set_epollout(Client *c, int on) {
+    if (c->want_write == on || c->fd < 0) return;
+    struct epoll_event ev = {0};
+    ev.events = EPOLLIN | (on ? EPOLLOUT : 0);
+    ev.data.ptr = c;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, c->fd, &ev) == 0) c->want_write = on;
+}
+
+static void mark_dead(Client *c);
+
+static void flush_client(Client *c) {
+    while (c->out_len > 0 && !c->dead) {
+        ssize_t n = send(c->fd, c->out, c->out_len, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            log_debug("send failed on fd %d: %s", c->fd, strerror(errno));
+            mark_dead(c);
+            return;
+        }
+        memmove(c->out, c->out + n, c->out_len - (size_t)n);
+        c->out_len -= (size_t)n;
     }
-
-    char packet[MAX_MESSAGE_SIZE];
-    size_t packet_len = 7 + payload_len; // Header (4) + Length (2) + Type (1) + Payload
-    packet[0] = 0x01; // Version
-    packet[1] = 0x00; // Flags (TCP, no compression)
-    packet[2] = (seq >> 8) & 0xFF; // Sequence number
-    packet[3] = seq & 0xFF;
-    packet[4] = (payload_len + 1) >> 8; // Length (Type + Payload)
-    packet[5] = (payload_len + 1) & 0xFF;
-    packet[6] = type;
-    memcpy(packet + 7, payload, payload_len);
-
-    printf("Sending to fd %d: %zu bytes: ", fd, packet_len);
-    for (size_t i = 0; i < packet_len && i < 32; i++) printf("%02x ", (unsigned char)packet[i]);
-    printf("\n");
-
-    ssize_t sent = send(fd, packet, packet_len, MSG_NOSIGNAL);
-    if (sent != (ssize_t)packet_len) {
-        fprintf(stderr, "Send failed on fd %d: %s\n", fd, strerror(errno));
-        return -1;
-    }
-    return 0;
+    if (c->dead) return;
+    set_epollout(c, c->out_len > 0);
+    if (c->out_len == 0 && c->close_after_flush) mark_dead(c);
 }
 
-// Send error message
-void send_error(int fd, uint16_t seq, uint16_t error_code, const char *msg) {
-    char payload[256];
-    size_t msg_len = strlen(msg);
-    if (msg_len > 252) msg_len = 252; // Prevent overflow
-    payload[0] = (error_code >> 8) & 0xFF;
-    payload[1] = error_code & 0xFF;
-    payload[2] = (msg_len >> 8) & 0xFF;
-    payload[3] = msg_len & 0xFF;
-    memcpy(payload + 4, msg, msg_len);
-    send_message(fd, MSG_ERROR, seq, payload, 4 + msg_len);
-}
-
-// Send system message
-void send_system(int fd, uint16_t seq, const uuid_t conn_id, const char *msg) {
-    char payload[256];
-    size_t msg_len = strlen(msg);
-    if (msg_len > 238) msg_len = 238; // Prevent overflow
-    memcpy(payload, conn_id, 16);
-    payload[16] = (msg_len >> 8) & 0xFF;
-    payload[17] = msg_len & 0xFF;
-    memcpy(payload + 18, msg, msg_len);
-    send_message(fd, MSG_SYSTEM, seq, payload, 18 + msg_len);
-}
-
-// Broadcast message (excluding sender)
-void broadcast_message(uint8_t type, const char *sender, const char *payload, size_t payload_len, int sender_fd) {
-    char packet[MAX_MESSAGE_SIZE];
-    size_t sender_len = strlen(sender);
-    if (sender_len > 255) sender_len = 255; // Prevent overflow
-    uint64_t timestamp = (uint64_t)time(NULL) * 1000;
-    
-    size_t packet_len = 7 + sender_len + 1 + 8 + 2 + payload_len;
-    if (packet_len > MAX_MESSAGE_SIZE) {
-        fprintf(stderr, "Broadcast message too large: %zu bytes\n", packet_len);
+/* Appends one frame to the client's output queue and tries to send it. */
+static void send_frame(Client *c, uint8_t type, uint16_t seq, const uint8_t *payload, size_t len) {
+    if (c->dead || c->fd < 0) return;
+    if (len > TUNDRA_MAX_PAYLOAD) {
+        log_info("refusing to send oversized payload (%zu bytes)", len);
         return;
     }
+    size_t need = c->out_len + TUNDRA_HEADER_LEN + len;
+    if (need > MAX_OUTBOUND_BYTES) {
+        log_info("fd %d exceeded outbound limit, disconnecting", c->fd);
+        mark_dead(c);
+        return;
+    }
+    if (need > c->out_cap) {
+        size_t cap = c->out_cap ? c->out_cap : 4096;
+        while (cap < need) cap *= 2;
+        uint8_t *p = realloc(c->out, cap);
+        if (!p) {
+            mark_dead(c);
+            return;
+        }
+        c->out = p;
+        c->out_cap = cap;
+    }
+    tundra_put_header(c->out + c->out_len, type, seq, len);
+    if (len) memcpy(c->out + c->out_len + TUNDRA_HEADER_LEN, payload, len);
+    c->out_len = need;
+    if (c->session) c->session->messages_sent++;
+    log_debug("queued type 0x%02x seq %u len %zu to fd %d", type, seq, len, c->fd);
+    flush_client(c);
+}
 
-    packet[0] = 0x01;
-    packet[1] = 0x00;
-    packet[2] = 0x00; // Sequence number handled per client
-    packet[3] = 0x00;
-    packet[4] = (payload_len + 11 + sender_len) >> 8;
-    packet[5] = (payload_len + 11 + sender_len) & 0xFF;
-    packet[6] = type;
-    packet[7] = sender_len;
-    memcpy(packet + 8, sender, sender_len);
-    for (int i = 0; i < 8; i++) packet[8 + sender_len + i] = (timestamp >> ((7 - i) * 8)) & 0xFF;
-    packet[16 + sender_len] = (payload_len >> 8) & 0xFF;
-    packet[17 + sender_len] = payload_len & 0xFF;
-    memcpy(packet + 18 + sender_len, payload, payload_len);
+/* Server-initiated frame: uses the session's own sequence counter. */
+static void push_frame(Client *c, uint8_t type, const uint8_t *payload, size_t len) {
+    uint16_t seq = c->session ? c->session->out_seq++ : 0;
+    send_frame(c, type, seq, payload, len);
+}
 
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].fd != -1 && clients[i].fd != sender_fd && clients[i].session && clients[i].session->active) {
-            packet[2] = (clients[i].session->last_seq >> 8) & 0xFF;
-            packet[3] = clients[i].session->last_seq & 0xFF;
-            clients[i].session->last_seq++;
-            clients[i].session->messages_sent++;
-            send(clients[i].fd, packet, packet_len, MSG_NOSIGNAL);
-            
-            // Buffer for disconnected clients
-            for (int j = 0; j < session_count; j++) {
-                if (!sessions[j].active && memcmp(sessions[j].username, sender, sender_len) != 0) {
-                    if (sessions[j].buffer_count < MAX_BUFFERED_MESSAGES) {
-                        sessions[j].message_buffer[sessions[j].buffer_count] = malloc(packet_len);
-                        if (!sessions[j].message_buffer[sessions[j].buffer_count]) {
-                            fprintf(stderr, "Memory allocation failed for buffer\n");
-                            continue;
-                        }
-                        memcpy(sessions[j].message_buffer[sessions[j].buffer_count], packet, packet_len);
-                        sessions[j].buffer_sizes[sessions[j].buffer_count] = packet_len;
-                        sessions[j].buffer_count++;
-                    }
-                }
-            }
+static void send_error(Client *c, uint16_t seq, uint16_t code, const char *msg) {
+    uint8_t buf[4 + 256];
+    size_t mlen = strlen(msg);
+    if (mlen > 256) mlen = 256;
+    tundra_put_u16(buf, code);
+    tundra_put_u16(buf + 2, (uint16_t)mlen);
+    memcpy(buf + 4, msg, mlen);
+    send_frame(c, MSG_ERROR, seq, buf, 4 + mlen);
+}
+
+static void send_system(Client *c, uint16_t seq, const uuid_t id, const char *msg) {
+    uint8_t buf[TUNDRA_UUID_LEN + 2 + 256];
+    size_t mlen = strlen(msg);
+    if (mlen > 256) mlen = 256;
+    memcpy(buf, id, TUNDRA_UUID_LEN);
+    tundra_put_u16(buf + TUNDRA_UUID_LEN, (uint16_t)mlen);
+    memcpy(buf + TUNDRA_UUID_LEN + 2, msg, mlen);
+    send_frame(c, MSG_SYSTEM, seq, buf, TUNDRA_UUID_LEN + 2 + mlen);
+}
+
+/* ------------------------------------------------------------------ */
+/* sessions                                                            */
+
+static void backlog_clear(Session *s) {
+    for (size_t i = 0; i < s->backlog_count; i++) {
+        free(s->backlog[(s->backlog_head + i) % MAX_BUFFERED_MESSAGES].payload);
+    }
+    s->backlog_head = 0;
+    s->backlog_count = 0;
+}
+
+static void backlog_push(Session *s, uint8_t type, const uint8_t *payload, size_t len) {
+    uint8_t *copy = malloc(len ? len : 1);
+    if (!copy) return;
+    memcpy(copy, payload, len);
+    if (s->backlog_count == MAX_BUFFERED_MESSAGES) {
+        /* full: drop the oldest */
+        free(s->backlog[s->backlog_head].payload);
+        s->backlog_head = (s->backlog_head + 1) % MAX_BUFFERED_MESSAGES;
+        s->backlog_count--;
+    }
+    size_t idx = (s->backlog_head + s->backlog_count) % MAX_BUFFERED_MESSAGES;
+    s->backlog[idx].type = type;
+    s->backlog[idx].payload = copy;
+    s->backlog[idx].len = len;
+    s->backlog_count++;
+}
+
+static void backlog_replay(Session *s) {
+    Client *c = s->client;
+    for (size_t i = 0; i < s->backlog_count; i++) {
+        BufferedFrame *f = &s->backlog[(s->backlog_head + i) % MAX_BUFFERED_MESSAGES];
+        if (c && !c->dead) push_frame(c, f->type, f->payload, f->len);
+    }
+    backlog_clear(s);
+}
+
+static Session *find_session_by_id(const uuid_t id) {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (sessions[i].state != SESSION_FREE && uuid_compare(sessions[i].id, id) == 0) return &sessions[i];
+    }
+    return NULL;
+}
+
+static Session *find_session_by_name(const char *name) {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (sessions[i].state != SESSION_FREE && strcmp(sessions[i].username, name) == 0) return &sessions[i];
+    }
+    return NULL;
+}
+
+static Session *alloc_session(void) {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (sessions[i].state == SESSION_FREE) {
+            memset(&sessions[i], 0, sizeof(sessions[i]));
+            return &sessions[i];
         }
     }
+    return NULL;
 }
 
-// Process incoming message
-void process_message(Client *client, const char *data, size_t len) {
-    if (len < 7) {
-        send_error(client->fd, 0, ERR_INVALID_FORMAT, "Message too short");
+static void attach(Session *s, Client *c) {
+    s->state = SESSION_ACTIVE;
+    s->client = c;
+    c->session = s;
+}
+
+/* Detaches a client from its session; the session is kept for RESUME_GRACE. */
+static void detach(Client *c) {
+    Session *s = c->session;
+    if (!s) return;
+    s->state = SESSION_DETACHED;
+    s->detached_at = mono_s();
+    s->client = NULL;
+    c->session = NULL;
+}
+
+/* Sends a notice (SYSTEM frame with nil id) to every active session except `skip`. */
+static void notice_all(const char *msg, const Session *skip) {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        Session *s = &sessions[i];
+        if (s->state != SESSION_ACTIVE || s == skip || !s->client) continue;
+        uint16_t seq = s->out_seq++;
+        send_system(s->client, seq, nil_uuid, msg);
+    }
+}
+
+/* Builds a broadcast payload once and delivers it to every session except
+ * the sender. Disconnected sessions get it in their backlog. */
+static void broadcast(uint8_t type, const Session *sender, const uint8_t *text, size_t text_len) {
+    size_t ulen = strlen(sender->username);
+    size_t len = 1 + ulen + 8 + 2 + text_len;
+    if (len > TUNDRA_MAX_PAYLOAD) return; /* callers already enforce TUNDRA_MAX_TEXT */
+
+    uint8_t *payload = malloc(len);
+    if (!payload) return;
+    payload[0] = (uint8_t)ulen;
+    memcpy(payload + 1, sender->username, ulen);
+    tundra_put_u64(payload + 1 + ulen, wall_ms());
+    tundra_put_u16(payload + 9 + ulen, (uint16_t)text_len);
+    memcpy(payload + 11 + ulen, text, text_len);
+
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        Session *s = &sessions[i];
+        if (s == sender) continue;
+        if (s->state == SESSION_ACTIVE && s->client) {
+            push_frame(s->client, type, payload, len);
+        } else if (s->state == SESSION_DETACHED) {
+            backlog_push(s, type, payload, len);
+        }
+    }
+    free(payload);
+}
+
+/* ------------------------------------------------------------------ */
+/* client lifecycle                                                    */
+
+static void mark_dead(Client *c) {
+    if (c->dead) return;
+    c->dead = 1;
+    detach(c);
+}
+
+static void reap_client(Client *c) {
+    if (c->fd >= 0) {
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, c->fd, NULL);
+        close(c->fd);
+        log_info("client on fd %d closed", c->fd);
+    }
+    free(c->out);
+    memset(c, 0, offsetof(Client, in));
+    c->fd = -1;
+    c->in_len = 0;
+}
+
+static void reap_dead_clients(void) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].fd >= 0 && clients[i].dead) reap_client(&clients[i]);
+    }
+}
+
+static Client *alloc_client(int fd) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].fd < 0) {
+            Client *c = &clients[i];
+            memset(c, 0, offsetof(Client, in));
+            c->in_len = 0;
+            c->fd = fd;
+            c->last_seen = mono_s();
+            return c;
+        }
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* message handlers                                                    */
+
+static int valid_username(const uint8_t *name, size_t len) {
+    if (len == 0 || len > TUNDRA_MAX_USERNAME) return 0;
+    for (size_t i = 0; i < len; i++) {
+        if (name[i] < 0x21 || name[i] > 0x7e) return 0; /* printable ASCII, no spaces */
+    }
+    return 1;
+}
+
+static void handle_register(Client *c, uint16_t seq, TundraReader *r) {
+    const uint8_t *id = tundra_rd_bytes(r, TUNDRA_UUID_LEN);
+    uint8_t ulen = tundra_rd_u8(r);
+    const uint8_t *uname = tundra_rd_bytes(r, ulen);
+    if (!tundra_rd_done(r) || !valid_username(uname, ulen)) {
+        send_error(c, seq, ERR_INVALID_FORMAT, "Invalid register payload");
+        return;
+    }
+    if (c->session) {
+        send_error(c, seq, ERR_INVALID_FORMAT, "Already registered");
         return;
     }
 
-    uint8_t version = data[0];
-    uint8_t flags = data[1];
-    uint16_t seq = (data[2] << 8) | data[3];
-    uint16_t payload_len = (data[4] << 8) | data[5];
-    uint8_t type = data[6];
+    char username[TUNDRA_MAX_USERNAME + 1];
+    memcpy(username, uname, ulen);
+    username[ulen] = '\0';
 
-    if (version != 0x01 || payload_len + 7 > len || payload_len > MAX_MESSAGE_SIZE - 7) {
-        send_error(client->fd, seq, ERR_INVALID_FORMAT, "Invalid version or length");
+    /* Resume: a non-nil id that matches a live session for the same user. */
+    if (uuid_compare(id, nil_uuid) != 0) {
+        Session *s = find_session_by_id(id);
+        if (s && strcmp(s->username, username) == 0) {
+            if (s->state == SESSION_ACTIVE && s->client && s->client != c) {
+                /* the old connection is still attached (e.g. half-open); replace it */
+                Client *old = s->client;
+                mark_dead(old);
+            }
+            attach(s, c);
+            char msg[96];
+            snprintf(msg, sizeof(msg), "Welcome back, %s!", username);
+            send_system(c, seq, s->id, msg);
+            backlog_replay(s);
+            log_info("%s resumed session", username);
+            return;
+        }
+        /* unknown or expired id: fall through to a fresh registration */
+    }
+
+    if (find_session_by_name(username)) {
+        send_error(c, seq, ERR_USERNAME_TAKEN, "Username already taken");
+        c->close_after_flush = 1;
+        flush_client(c);
         return;
     }
 
-    if (!client->session) {
-        client->session = &sessions[session_count]; // Temporary assignment for validation
+    Session *s = alloc_session();
+    if (!s) {
+        send_error(c, seq, ERR_SERVER_ERROR, "Server full");
+        c->close_after_flush = 1;
+        flush_client(c);
+        return;
     }
-    client->session->messages_received++;
-    client->session->last_seen = time(NULL);
+    uuid_generate(s->id);
+    memcpy(s->username, username, (size_t)ulen + 1);
+    s->connected_at = mono_s();
+    attach(s, c);
+
+    char msg[96];
+    snprintf(msg, sizeof(msg), "Welcome, %s!", username);
+    send_system(c, seq, s->id, msg);
+
+    snprintf(msg, sizeof(msg), "%s has joined the chat.", username);
+    notice_all(msg, s);
+    log_info("%s registered", username);
+}
+
+static void handle_message(Client *c, uint16_t seq, TundraReader *r) {
+    uint16_t mlen = tundra_rd_u16(r);
+    const uint8_t *text = tundra_rd_bytes(r, mlen);
+    if (!tundra_rd_done(r)) {
+        send_error(c, seq, ERR_INVALID_FORMAT, "Invalid message payload");
+        return;
+    }
+    if (mlen > TUNDRA_MAX_TEXT) {
+        send_error(c, seq, ERR_INVALID_FORMAT, "Message too long");
+        return;
+    }
+    broadcast(MSG_BROADCAST_MESSAGE, c->session, text, mlen);
+}
+
+static void handle_agent_command(Client *c, uint16_t seq, TundraReader *r) {
+    uint8_t alen = tundra_rd_u8(r);
+    const uint8_t *agent = tundra_rd_bytes(r, alen);
+    uint16_t clen = tundra_rd_u16(r);
+    const uint8_t *cmd = tundra_rd_bytes(r, clen);
+    if (!tundra_rd_done(r) || alen == 0) {
+        send_error(c, seq, ERR_INVALID_FORMAT, "Invalid agent command payload");
+        return;
+    }
+    size_t text_len = (size_t)alen + 1 + clen;
+    if (text_len > TUNDRA_MAX_TEXT) {
+        send_error(c, seq, ERR_INVALID_FORMAT, "Agent command too long");
+        return;
+    }
+    uint8_t *text = malloc(text_len);
+    if (!text) {
+        send_error(c, seq, ERR_SERVER_ERROR, "Out of memory");
+        return;
+    }
+    memcpy(text, agent, alen);
+    text[alen] = ' ';
+    memcpy(text + alen + 1, cmd, clen);
+    broadcast(MSG_BROADCAST_AGENT, c->session, text, text_len);
+    free(text);
+}
+
+static void handle_pong(Client *c) {
+    if (c->ping_sent_ms) {
+        uint64_t rtt = mono_ms() - c->ping_sent_ms;
+        c->session->latency_ms = rtt > UINT32_MAX ? UINT32_MAX : (uint32_t)rtt;
+        c->ping_sent_ms = 0;
+    }
+}
+
+static void handle_health_check(Client *c, uint16_t seq) {
+    Session *s = c->session;
+    uint8_t buf[25];
+    uint64_t uptime = (uint64_t)(mono_s() - s->connected_at) * 1000u;
+    tundra_put_u64(buf, wall_ms());
+    buf[8] = 0x01; /* connected */
+    tundra_put_u32(buf + 9, s->latency_ms);
+    tundra_put_u32(buf + 13, uptime > UINT32_MAX ? UINT32_MAX : (uint32_t)uptime);
+    tundra_put_u32(buf + 17, s->messages_sent);
+    tundra_put_u32(buf + 21, s->messages_received);
+    send_frame(c, MSG_HEALTH_RESULT, seq, buf, sizeof(buf));
+}
+
+static void process_frame(Client *c, const uint8_t *frame, size_t payload_len) {
+    uint8_t version = frame[0];
+    uint16_t seq = tundra_get_u16(frame + 2);
+    uint8_t type = frame[6];
+    TundraReader r = tundra_reader(frame + TUNDRA_HEADER_LEN, payload_len);
+
+    if (version != TUNDRA_VERSION) {
+        send_error(c, seq, ERR_INVALID_FORMAT, "Unsupported protocol version");
+        c->close_after_flush = 1;
+        flush_client(c);
+        return;
+    }
+
+    c->last_seen = mono_s();
+    log_debug("fd %d: type 0x%02x seq %u len %zu", c->fd, type, seq, payload_len);
+
+    if (type == MSG_REGISTER) {
+        handle_register(c, seq, &r);
+        return;
+    }
+    if (!c->session) {
+        send_error(c, seq, ERR_NOT_REGISTERED, "Not registered");
+        return;
+    }
+    c->session->messages_received++;
 
     switch (type) {
-        case MSG_REGISTER: {
-            if (payload_len < 17) {
-                send_error(client->fd, seq, ERR_INVALID_FORMAT, "Invalid register payload");
-                return;
-            }
-            uuid_t conn_id;
-            memcpy(conn_id, data + 7, 16);
-            uint8_t username_len = data[23];
-            if (username_len > MAX_USERNAME_LEN || payload_len < 17 + username_len) {
-                send_error(client->fd, seq, ERR_INVALID_FORMAT, "Invalid username length");
-                return;
-            }
-
-            char username[MAX_USERNAME_LEN + 1];
-            memcpy(username, data + 24, username_len);
-            username[username_len] = '\0';
-
-            // Check for existing session (reconnection)
-            int session_idx = -1;
-            for (int i = 0; i < session_count; i++) {
-                if (uuid_compare(sessions[i].connection_id, conn_id) == 0 && sessions[i].active) {
-                    session_idx = i;
-                    break;
-                }
-            }
-
-            // Check for username conflict
-            int name_taken = 0;
-            for (int i = 0; i < session_count; i++) {
-                if (sessions[i].active && strcmp(sessions[i].username, username) == 0 && session_idx != i) {
-                    name_taken = 1;
-                    break;
-                }
-            }
-
-            if (name_taken && session_idx == -1) {
-                send_error(client->fd, seq, ERR_USERNAME_TAKEN, "Username already taken");
-                close(client->fd);
-                return;
-            }
-
-            // Create or update session
-            if (session_idx == -1) {
-                session_idx = session_count++;
-                uuid_generate(sessions[session_idx].connection_id);
-                sessions[session_idx].connected_at = time(NULL);
-                sessions[session_idx].buffer_count = 0;
-            }
-            sessions[session_idx].active = 1;
-            sessions[session_idx].last_seen = time(NULL);
-            sessions[session_idx].fd = client->fd;
-            strncpy(sessions[session_idx].username, username, MAX_USERNAME_LEN);
-            sessions[session_idx].username[MAX_USERNAME_LEN] = '\0';
-            client->session = &sessions[session_idx];
-
-            // Send welcome and buffered messages
-            char welcome[64];
-            snprintf(welcome, sizeof(welcome), "Welcome, %s!", username);
-            send_system(client->fd, seq, sessions[session_idx].connection_id, welcome);
-
-            for (int i = 0; i < sessions[session_idx].buffer_count; i++) {
-                send(client->fd, sessions[session_idx].message_buffer[i], sessions[session_idx].buffer_sizes[i], MSG_NOSIGNAL);
-                free(sessions[session_idx].message_buffer[i]);
-            }
-            sessions[session_idx].buffer_count = 0;
-            break;
-        }
-
-        case MSG_MESSAGE: {
-            if (!client->session || !client->session->active) {
-                send_error(client->fd, seq, ERR_SESSION_EXPIRED, "Not registered");
-                return;
-            }
-            if (payload_len < 3) {
-                send_error(client->fd, seq, ERR_INVALID_FORMAT, "Invalid message payload");
-                return;
-            }
-            uint16_t msg_len = (data[7] << 8) | data[8];
-            if (msg_len + 9 > payload_len) {
-                send_error(client->fd, seq, ERR_INVALID_FORMAT, "Invalid message length");
-                return;
-            }
-            broadcast_message(MSG_BROADCAST_MESSAGE, client->session->username, data + 9, msg_len, client->fd);
-            break;
-        }
-
-        case MSG_AGENT_COMMAND: {
-            if (!client->session || !client->session->active) {
-                send_error(client->fd, seq, ERR_SESSION_EXPIRED, "Not registered");
-                return;
-            }
-            if (payload_len < 4) {
-                send_error(client->fd, seq, ERR_INVALID_FORMAT, "Invalid agent command payload");
-                return;
-            }
-            uint8_t agent_len = data[7];
-            uint16_t cmd_len = (data[8 + agent_len] << 8) | data[9 + agent_len];
-            if (payload_len < 4 + agent_len + cmd_len) {
-                send_error(client->fd, seq, ERR_INVALID_FORMAT, "Invalid agent command length");
-                return;
-            }
-            char agent[256], cmd[256];
-            memcpy(agent, data + 8, agent_len);
-            agent[agent_len] = '\0';
-            memcpy(cmd, data + 10 + agent_len, cmd_len);
-            cmd[cmd_len] = '\0';
-
-            char payload[512];
-            size_t payload_len = snprintf(payload, sizeof(payload), "%s %s", agent, cmd);
-            broadcast_message(MSG_BROADCAST_AGENT, client->session->username, payload, payload_len, client->fd);
-            break;
-        }
-
-        case MSG_PONG: {
-            if (!client->session || !client->session->active) return;
-            client->session->last_pong = time(NULL);
-            if (client->session->last_ping) {
-                client->session->latency = (client->session->last_pong - client->session->last_ping) * 1000;
-            }
-            break;
-        }
-
-        case MSG_HEALTH_CHECK: {
-            if (!client->session || !client->session->active) return;
-            char payload[25];
-            uint64_t timestamp = (uint64_t)time(NULL) * 1000;
-            for (int i = 0; i < 8; i++) payload[i] = (timestamp >> ((7 - i) * 8)) & 0xFF;
-            payload[8] = 0x01; // Connected
-            for (int i = 0; i < 4; i++) payload[9 + i] = (client->session->latency >> ((3 - i) * 8)) & 0xFF;
-            for (int i = 0; i < 4; i++) payload[13 + i] = ((uint32_t)(time(NULL) - client->session->connected_at) * 1000 >> ((3 - i) * 8)) & 0xFF;
-            for (int i = 0; i < 4; i++) payload[17 + i] = (client->session->messages_sent >> ((3 - i) * 8)) & 0xFF;
-            for (int i = 0; i < 4; i++) payload[21 + i] = (client->session->messages_received >> ((3 - i) * 8)) & 0xFF;
-            send_message(client->fd, MSG_HEALTH_RESULT, seq, payload, 25);
-            break;
-        }
-
+        case MSG_MESSAGE:       handle_message(c, seq, &r); break;
+        case MSG_AGENT_COMMAND: handle_agent_command(c, seq, &r); break;
+        case MSG_PONG:          handle_pong(c); break;
+        case MSG_HEALTH_CHECK:  handle_health_check(c, seq); break;
         default:
-            send_error(client->fd, seq, ERR_INVALID_FORMAT, "Unknown message type");
+            send_error(c, seq, ERR_INVALID_FORMAT, "Unknown message type");
             break;
     }
 }
 
-// Cleanup inactive sessions
-void cleanup_sessions() {
-    time_t now = time(NULL);
-    for (int i = 0; i < session_count; i++) {
-        if (sessions[i].active && now - sessions[i].last_seen > SESSION_TIMEOUT) {
-            sessions[i].active = 0;
-            close(sessions[i].fd);
-            for (int j = 0; j < sessions[i].buffer_count; j++) free(sessions[i].message_buffer[j]);
-            sessions[i].buffer_count = 0;
-            char msg[64];
-            snprintf(msg, sizeof(msg), "%s has left the chat.", sessions[i].username);
-            broadcast_message(MSG_SYSTEM, "Server", msg, strlen(msg), -1);
+/* Processes every complete frame currently in the input buffer. */
+static void process_input(Client *c) {
+    size_t off = 0;
+    while (!c->dead && !c->close_after_flush && c->in_len - off >= TUNDRA_HEADER_LEN) {
+        size_t plen = tundra_get_u16(c->in + off + 4);
+        if (c->in_len - off < TUNDRA_HEADER_LEN + plen) break;
+        process_frame(c, c->in + off, plen);
+        off += TUNDRA_HEADER_LEN + plen;
+    }
+    if (off > 0) {
+        memmove(c->in, c->in + off, c->in_len - off);
+        c->in_len -= off;
+    }
+}
+
+static void read_client(Client *c) {
+    while (!c->dead) {
+        /* The buffer holds one maximum-size frame, and complete frames are
+         * consumed after every read, so there is always room here. */
+        ssize_t n = recv(c->fd, c->in + c->in_len, sizeof(c->in) - c->in_len, 0);
+        if (n > 0) {
+            c->in_len += (size_t)n;
+            process_input(c);
+            continue;
+        }
+        if (n == 0) {
+            mark_dead(c);
+            return;
+        }
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) mark_dead(c);
+        return;
+    }
+}
+
+static void accept_clients(void) {
+    for (;;) {
+        int fd = accept4(server_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (fd < 0) {
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) log_info("accept failed: %s", strerror(errno));
+            return;
+        }
+        Client *c = alloc_client(fd);
+        if (!c) {
+            log_info("no free client slots, rejecting fd %d", fd);
+            close(fd);
+            continue;
+        }
+        struct epoll_event ev = {0};
+        ev.events = EPOLLIN;
+        ev.data.ptr = c;
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+            log_info("epoll add failed: %s", strerror(errno));
+            close(fd);
+            c->fd = -1;
+            continue;
+        }
+        log_info("client connected on fd %d", fd);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* periodic work                                                       */
+
+static void expire_idle(void) {
+    time_t now = mono_s();
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        Client *c = &clients[i];
+        if (c->fd >= 0 && !c->dead && now - c->last_seen > IDLE_TIMEOUT) {
+            log_info("fd %d idle timeout", c->fd);
+            mark_dead(c);
+        }
+    }
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        Session *s = &sessions[i];
+        if (s->state == SESSION_DETACHED && now - s->detached_at > RESUME_GRACE) {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "%s has left the chat.", s->username);
+            backlog_clear(s);
+            s->state = SESSION_FREE;
+            notice_all(msg, NULL);
+            log_info("%s", msg);
         }
     }
 }
 
-// Send pings
-void send_pings() {
-    char payload[8];
-    uint64_t timestamp = (uint64_t)time(NULL) * 1000;
-    for (int i = 0; i < 8; i++) payload[i] = (timestamp >> ((7 - i) * 8)) & 0xFF;
-
+static void send_pings(void) {
+    uint8_t buf[8];
+    tundra_put_u64(buf, wall_ms());
     for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].fd != -1 && clients[i].session && clients[i].session->active) {
-            clients[i].session->last_ping = time(NULL);
-            clients[i].session->last_seq++;
-            send_message(clients[i].fd, MSG_PING, clients[i].session->last_seq, payload, 8);
-        }
+        Client *c = &clients[i];
+        if (c->fd < 0 || c->dead || !c->session) continue;
+        c->ping_sent_ms = mono_ms();
+        push_frame(c, MSG_PING, buf, sizeof(buf));
     }
 }
 
-int main() {
-    // Initialize clients and sessions
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        clients[i].fd = -1;
-        clients[i].session = NULL;
-        clients[i].buffer_pos = 0;
-    }
-    session_count = 0;
+/* ------------------------------------------------------------------ */
 
-    // Create server socket
-    server_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+static void usage(const char *prog) {
+    fprintf(stderr, "usage: %s [-p port] [-v]\n", prog);
+}
+
+int main(int argc, char **argv) {
+    int port = DEFAULT_PORT;
+    int opt;
+    while ((opt = getopt(argc, argv, "p:vh")) != -1) {
+        switch (opt) {
+            case 'p': port = atoi(optarg); break;
+            case 'v': verbose = 1; break;
+            default: usage(argv[0]); return opt == 'h' ? 0 : 1;
+        }
+    }
+    if (port <= 0 || port > 65535) {
+        usage(argv[0]);
+        return 1;
+    }
+
+    for (int i = 0; i < MAX_CLIENTS; i++) clients[i].fd = -1;
+
+    struct sigaction sa = {0};
+    sa.sa_handler = on_signal;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
+
+    server_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (server_fd < 0) {
-        perror("Socket creation failed");
+        perror("socket");
         return 1;
     }
+    int one = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
-    // Set SO_REUSEADDR to avoid "Address already in use"
-    int opt = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("Setsockopt failed");
-        close(server_fd);
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((uint16_t)port);
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind");
         return 1;
     }
-
-    struct sockaddr_in server_addr = {0};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
-
-    if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Bind failed");
-        close(server_fd);
-        return 1;
-    }
-
     if (listen(server_fd, 128) < 0) {
-        perror("Listen failed");
-        close(server_fd);
+        perror("listen");
         return 1;
     }
 
-    // Create epoll instance
-    epoll_fd = epoll_create1(0);
+    epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (epoll_fd < 0) {
-        perror("Epoll creation failed");
-        close(server_fd);
+        perror("epoll_create1");
         return 1;
     }
-
-    struct epoll_event ev, events[32];
+    struct epoll_event ev = {0};
     ev.events = EPOLLIN;
-    ev.data.fd = server_fd;
+    ev.data.ptr = &listen_marker;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) < 0) {
-        perror("Epoll add server failed");
-        close(server_fd);
-        close(epoll_fd);
+        perror("epoll_ctl");
         return 1;
     }
 
-    time_t last_cleanup = time(NULL);
-    time_t last_ping = time(NULL);
+    log_info("Tundra server listening on port %d", port);
 
-    printf("Server listening on port %d\n", PORT);
+    struct epoll_event events[MAX_EVENTS];
+    time_t last_sweep = mono_s();
+    time_t last_ping = mono_s();
 
-    while (1) {
-        int nfds = epoll_wait(epoll_fd, events, 32, 1000);
-        time_t now = time(NULL);
+    while (running) {
+        int n = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
+        if (n < 0 && errno != EINTR) {
+            perror("epoll_wait");
+            break;
+        }
 
-        // Periodic cleanup and pings
-        if (now - last_cleanup >= 10) {
-            cleanup_sessions();
-            last_cleanup = now;
+        for (int i = 0; i < n; i++) {
+            if (events[i].data.ptr == &listen_marker) {
+                accept_clients();
+                continue;
+            }
+            Client *c = events[i].data.ptr;
+            if (c->fd < 0 || c->dead) continue;
+            if (events[i].events & (EPOLLERR | EPOLLHUP)) {
+                read_client(c); /* pick up any final bytes / EOF */
+                mark_dead(c);
+                continue;
+            }
+            if (events[i].events & EPOLLIN) read_client(c);
+            if (!c->dead && (events[i].events & EPOLLOUT)) flush_client(c);
+        }
+
+        time_t now = mono_s();
+        if (now - last_sweep >= 1) {
+            expire_idle();
+            last_sweep = now;
         }
         if (now - last_ping >= PING_INTERVAL) {
             send_pings();
             last_ping = now;
         }
 
-        for (int i = 0; i < nfds; i++) {
-            if (events[i].data.fd == server_fd) {
-                struct sockaddr_in client_addr;
-                socklen_t addr_len = sizeof(client_addr);
-                int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &addr_len);
-                if (client_fd < 0) {
-                    fprintf(stderr, "Accept failed: %s\n", strerror(errno));
-                    continue;
-                }
-
-                // Add client to epoll
-                ev.events = EPOLLIN | EPOLLET;
-                ev.data.fd = client_fd;
-                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) < 0) {
-                    fprintf(stderr, "Epoll add client failed: %s\n", strerror(errno));
-                    close(client_fd);
-                    continue;
-                }
-
-                // Find free client slot
-                int client_idx = -1;
-                for (int j = 0; j < MAX_CLIENTS; j++) {
-                    if (clients[j].fd == -1) {
-                        client_idx = j;
-                        break;
-                    }
-                }
-                if (client_idx == -1) {
-                    fprintf(stderr, "No free client slots\n");
-                    close(client_fd);
-                    continue;
-                }
-
-                clients[client_idx].fd = client_fd;
-                clients[client_idx].session = NULL;
-                clients[client_idx].buffer_pos = 0;
-                printf("Client connected on fd %d\n", client_fd);
-            } else {
-                int fd = events[i].data.fd;
-                int client_idx = -1;
-                for (int j = 0; j < MAX_CLIENTS; j++) {
-                    if (clients[j].fd == fd) {
-                        client_idx = j;
-                        break;
-                    }
-                }
-                if (client_idx == -1) continue;
-
-                Client *client = &clients[client_idx];
-                ssize_t bytes_read = recv(fd, client->buffer + client->buffer_pos, MAX_MESSAGE_SIZE - client->buffer_pos, 0);
-                if (bytes_read <= 0) {
-                    if (client->session) client->session->active = 0;
-                    close(fd);
-                    clients[client_idx].fd = -1;
-                    clients[client_idx].session = NULL;
-                    clients[client_idx].buffer_pos = 0;
-                    printf("Client disconnected on fd %d\n", fd);
-                    continue;
-                }
-
-                client->buffer_pos += bytes_read;
-                printf("Received %zd bytes from fd %d, total %zu\n", bytes_read, fd, client->buffer_pos);
-
-                while (client->buffer_pos >= 6) {
-                    uint16_t payload_len = (client->buffer[4] << 8) | client->buffer[5];
-                    if (client->buffer_pos < 7 + payload_len) break;
-
-                    process_message(client, client->buffer, 7 + payload_len);
-                    memmove(client->buffer, client->buffer + 7 + payload_len, client->buffer_pos - (7 + payload_len));
-                    client->buffer_pos -= 7 + payload_len;
-                }
-            }
-        }
+        /* Close sockets only after the whole event batch is handled, so a
+         * reused fd can never be confused with a client closed in this batch. */
+        reap_dead_clients();
     }
 
+    log_info("shutting down");
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].fd >= 0) {
+            mark_dead(&clients[i]);
+            reap_client(&clients[i]);
+        }
+    }
+    for (int i = 0; i < MAX_SESSIONS; i++) backlog_clear(&sessions[i]);
     close(epoll_fd);
     close(server_fd);
     return 0;
