@@ -18,5 +18,16 @@ jobs:
       - name: Build
         run: |
           if [ "${{ matrix.build }}" = "asan" ]; then make asan; else make; fi
+      - name: Codec unit tests
+        run: ./build/codec_test
       - name: Integration tests
         run: ./tests/integration.sh
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-rt-18-dev uuid-dev
+      - name: Fuzz the codec for 60 seconds
+        run: make fuzz-run FUZZ_TIME=60
