@@ -22,7 +22,7 @@ The Tundra Chat Protocol is a production-ready communication system that goes fa
 ### Message Reliability
 - **Message Buffering**: Stores up to 50 messages per disconnected user
 - **Offline Message Delivery**: Delivers buffered messages on reconnection
-- **No Message Loss**: Prevents message loss during network interruptions
+- **Bounded Backlog**: A disconnected session is held for 2 minutes; if more than 50 messages arrive in that window, the oldest are dropped (there are no end-to-end ACKs yet)
 
 ### Health Monitoring & Performance
 - **Built-in Ping/Pong**: 30-second interval heartbeat mechanism
@@ -65,23 +65,50 @@ The Tundra Chat Protocol is a production-ready communication system that goes fa
 
 ## � Protocol Specification
 
-### Message Header Format (7 bytes)
+`tundra_protocol.h` is the source of truth; this section mirrors it.
+
+### Frame Format
 ```
-[Version:1][Flags:1][Sequence:2][Length:2][Type:1][Payload:N]
+[Version:1][Flags:1][Sequence:2][Length:2][Type:1][Payload:Length]
 ```
 
-- **Version**: Protocol version (0x01)
-- **Flags**: Connection flags (TCP/UDP, compression, etc.)
-- **Sequence**: Message sequence number for ordering
-- **Length**: Payload length + 1 (includes type byte)
-- **Type**: Message type identifier
-- **Payload**: Variable-length message data
+- All integers are big-endian.
+- **Version**: `0x01`. Frames with any other version get an error and the connection is closed.
+- **Flags**: reserved, send `0`.
+- **Sequence**: replies (`MSG_SYSTEM` welcome, `MSG_ERROR`, `MSG_HEALTH_RESULT`) echo the sequence number of the request they answer. Frames the server pushes on its own (broadcasts, notices, pings) use a per-session counter.
+- **Length**: number of payload bytes *after* the 7-byte header. A frame is always exactly `7 + Length` bytes.
+- **Payload**: at most 65535 bytes.
+
+### Payloads
+
+| Type | Payload |
+|------|---------|
+| `MSG_REGISTER` | `id:16` `ulen:1` `username:ulen`. Use an all-zero `id` for a new session, or the id from a previous welcome to resume. Usernames are 1 to 32 printable ASCII characters, no spaces. |
+| `MSG_MESSAGE` | `mlen:2` `text:mlen` |
+| `MSG_AGENT_COMMAND` | `alen:1` `agent:alen` `clen:2` `command:clen` |
+| `MSG_PONG` | echo of the `MSG_PING` payload |
+| `MSG_HEALTH_CHECK` | empty |
+| `MSG_SYSTEM` | `id:16` `mlen:2` `text:mlen`. `id` is your session id in the welcome, all zeros in notices (joins and leaves). |
+| `MSG_BROADCAST_MESSAGE` | `ulen:1` `username:ulen` `timestamp_ms:8` `mlen:2` `text:mlen` |
+| `MSG_BROADCAST_AGENT` | same as `MSG_BROADCAST_MESSAGE`, text is `"<agent> <command>"` |
+| `MSG_PING` | `timestamp_ms:8` |
+| `MSG_ERROR` | `code:2` `mlen:2` `text:mlen` |
+| `MSG_HEALTH_RESULT` | `timestamp_ms:8` `status:1` `latency_ms:4` `uptime_ms:4` `sent:4` `received:4` |
+
+Every length field is validated against the frame; payloads with missing or trailing bytes are rejected with `ERR_INVALID_FORMAT`.
+
+### Session Lifecycle
+1. Register with a zero id. The welcome `MSG_SYSTEM` carries your session id.
+2. If the connection drops, the session is held for 2 minutes and messages for it are buffered (up to 50, oldest dropped first).
+3. Reconnect and register with the same id and username to resume; the backlog is delivered right after the welcome. If the old connection is still open, it is replaced.
+4. After the hold period, the session is released, its username becomes available, and other users get a "has left the chat" notice.
 
 ### Error Codes
-- `ERR_USERNAME_TAKEN` (0x0001): Username already in use
+- `ERR_USERNAME_TAKEN` (0x0001): Username already in use (connection is closed)
 - `ERR_INVALID_FORMAT` (0x0002): Malformed message
 - `ERR_SESSION_EXPIRED` (0x0003): Session timeout
-- `ERR_SERVER_ERROR` (0x0004): Internal server error
+- `ERR_SERVER_ERROR` (0x0004): Internal server error, or server full
+- `ERR_NOT_REGISTERED` (0x0005): Message sent before registering
 
 ## 🏗️ Architecture
 
@@ -100,28 +127,32 @@ The Tundra Chat Protocol is a production-ready communication system that goes fa
 
 ## 🚀 Getting Started
 
-### Building the Server
+### Building
 ```bash
-cd build
-gcc -o tundra_chat_server ../tundra_chat_server.c -luuid
-```
-
-### Building the Client
-```bash
-cd build
-gcc -o tundra_chat_client ../test_client.c
+sudo apt-get install uuid-dev   # libuuid headers
+make                            # builds build/tundra_chat_server and build/tundra_client
+make test                       # end-to-end tests
+make asan && ./tests/integration.sh   # same tests under AddressSanitizer + UBSan
 ```
 
 ### Running the Server
 ```bash
-./tundra_chat_server
+./build/tundra_chat_server [-p port] [-v]
 ```
-Server will start listening on port 4242.
+Listens on port 4242 by default. `-v` logs every frame.
 
 ### Running the Client
 ```bash
-./tundra_chat_client
+# listen for 30 seconds
+./build/tundra_client -u alice -w 30
+
+# send two messages
+./build/tundra_client -u bob -m "hello" -m "anyone here?"
+
+# resume a previous session with the id printed on the SESSION line
+./build/tundra_client -u alice -r 1b4e28ba-2fa1-11d2-883f-0016d3cca427 -w 10
 ```
+The client prints one line per frame (`SESSION`, `SYSTEM`, `MSG`, `AGENT`, `ERROR`, `HEALTH`, `PING`) and answers pings automatically.
 
 ## 📖 Usage Examples
 
@@ -166,9 +197,11 @@ send_message(sock, MSG_HEALTH_CHECK, seq, NULL, 0);
 - `PORT`: 4242 (default)
 - `MAX_CLIENTS`: 1000
 - `MAX_MESSAGE_SIZE`: 65535 bytes
-- `SESSION_TIMEOUT`: 120 seconds
+- `IDLE_TIMEOUT`: 120 seconds without any frame before a connection is dropped
+- `RESUME_GRACE`: 120 seconds a disconnected session is held
 - `PING_INTERVAL`: 30 seconds
 - `MAX_BUFFERED_MESSAGES`: 50
+- `MAX_OUTBOUND_BYTES`: 1 MiB queued per client; slower clients are disconnected
 
 ### Dependencies
 - Linux (epoll support required)
