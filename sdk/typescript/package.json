@@ -1,0 +1,49 @@
+{
+  "name": "@tundra/client",
+  "version": "0.1.0",
+  "description": "TypeScript client and agent SDK for the Tundra chat server (Node and browsers, no dependencies)",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./codec": {
+      "types": "./dist/codec.d.ts",
+      "import": "./dist/codec.js",
+      "default": "./dist/codec.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "browser": {
+    "./dist/tcp.js": false
+  },
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build",
+    "clean": "rm -rf dist",
+    "test": "node --test test/sdk.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ingen0s/tundra.git",
+    "directory": "sdk/typescript"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3"
+  }
+}
